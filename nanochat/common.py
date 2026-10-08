@@ -263,6 +263,7 @@ def get_peak_flops(device_name: str) -> float:
         (["mi250"], 362.1e12),
         # Consumer RTX
         (["5090"], 209.5e12),
+        (["5060", "ti"], 47.4e12),
         (["4090"], 165.2e12),
         (["3090"], 71e12),
     )
@@ -316,6 +317,7 @@ def get_peak_bandwidth(device_name: str) -> float:
         (["mi250"], 3.28e12),
         # Consumer RTX
         (["5090"], 1.79e12),
+        (["5060", "ti"], 448e9),
         (["4090"], 1.01e12),
         (["3090"], 936e9),
     )
