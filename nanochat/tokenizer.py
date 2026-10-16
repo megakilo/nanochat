@@ -20,10 +20,19 @@ SPECIAL_TOKENS = [
     "<|output_end|>",
 ]
 
-# NOTE: this split pattern deviates from GPT-4 in that we use \p{N}{1,2} instead of \p{N}{1,3}
-# I did this because I didn't want to "waste" too many tokens on numbers for smaller vocab sizes.
-# I verified that 2 is the sweet spot for vocab size of 32K. 1 is a bit worse, 3 was worse still.
-SPLIT_PATTERN = r"""'(?i:[sdmt]|ll|ve|re)|[^\r\n\p{L}\p{N}]?+\p{L}+|\p{N}{1,2}| ?[^\s\p{L}\p{N}]++[\r\n]*|\s*[\r\n]|\s+(?!\S)|\s+"""
+# NOTE: this split pattern deviates from GPT-4 in that we:
+# 1) use \p{N}{1,2} instead of \p{N}{1,3} to avoid wasting tokens on numbers for smaller 32K vocab sizes.
+# 2) split letters using GPT-4o (o200k_base) case-aware rules so camelCase/PascalCase split cleanly (e.g. "camelCase" -> ["camel", "Case"]).
+SPLIT_PATTERN = "|".join([
+    r"""'(?i:[sdmt]|ll|ve|re)""",
+    r"""[^\r\n\p{L}\p{N}]?+[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+""",
+    r"""[^\r\n\p{L}\p{N}]?+[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*""",
+    r"""\p{N}{1,2}""",
+    r""" ?[^\s\p{L}\p{N}]++[\r\n]*""",
+    r"""\s*[\r\n]""",
+    r"""\s+(?!\S)""",
+    r"""\s+""",
+])
 
 # -----------------------------------------------------------------------------
 # Tokenizer based on rustbpe + tiktoken combo

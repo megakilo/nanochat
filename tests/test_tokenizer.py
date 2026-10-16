@@ -134,3 +134,15 @@ def test_render_for_completion(tokenizer):
     # the assistant response itself must not be present
     stripped = tokenizer.encode("this gets stripped")
     assert not any(ids[i:i + len(stripped)] == stripped for i in range(len(ids)))
+
+
+def test_camelcase_split():
+    # Even when "camelCase" is the only string in the corpus, the pre-tokenizer
+    # must split at the lowercase->uppercase transition ("camel" | "Case") so
+    # BPE merges "camel" and "Case" as two separate tokens rather than one.
+    corpus = ["camelCase"] * 50
+    tok = RustBPETokenizer.train_from_iterator(iter(corpus), 256 + len(SPECIAL_TOKENS) + 8)
+    ids = tok.encode("camelCase")
+    tokens = [tok.decode([i]) for i in ids]
+    assert tokens == ["camel", "Case"]
+
