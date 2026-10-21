@@ -1,8 +1,15 @@
 """
-Unified Flash Attention interface with automatic FA3/SDPA switching.
+Unified Flash Attention interface with automatic FA3/FA4/FA2/SDPA switching.
 
-Exports `flash_attn` module that matches the FA3 API exactly, but falls back
-to PyTorch SDPA on incompatible CUDA GPUs, MPS, and CPU.
+Exports `flash_attn` module that matches the FA3 API exactly, but can route to
+Flash Attention 4 (`kernels-community/flash-attn4`, CuTe DSL), Flash Attention 2
+(`kernels-community/flash-attn2`), or fall back to PyTorch SDPA on incompatible
+CUDA GPUs, MPS, and CPU.
+
+Backend selection (in order of precedence):
+    1. set_attn_impl('fa4' | 'fa3' | 'fa2' | 'sdpa' | 'auto')  (e.g. via --attn-impl CLI flag)
+    2. NANOCHAT_ATTN_IMPL environment variable                  (same values)
+    3. 'auto': FA3 (sm80/sm90), else FA4 (sm100/sm110), else FA2, else FA4, else SDPA
 
 Usage (drop-in replacement for FA3):
     from nanochat.flash_attention import flash_attn
@@ -13,8 +20,14 @@ Usage (drop-in replacement for FA3):
     # Inference (with KV cache)
     y = flash_attn.flash_attn_with_kvcache(q, k_cache, v_cache, k=k, v=v, ...)
 """
+import os
+
+os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
+
 import torch
 import torch.nn.functional as F
+
+VALID_IMPLS = ("auto", "fa4", "fa3", "fa2", "sdpa")
 
 
 # =============================================================================
@@ -26,22 +39,18 @@ def _load_flash_attention_3():
         return None
     try:
         major, _ = torch.cuda.get_device_capability()
-        # FA3 kernels are currently compiled for Hopper (sm90), Ada (sm89) and Ampere (sm80/sm86)
-        # Blackwell (sm100) needs SDPA fallback until FA3 is recompiled or FA4 is released
-        import os
-        os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
+        # FA3 kernels are compiled for Hopper (sm90) and Ampere/Ada (sm80/sm86/sm89)
+        if major not in (8, 9):
+            return None
         from kernels import get_kernel, has_kernel
         # The varunneal kernel obtains better results for H100/Hopper
         if major == 9:
-            hf_kernel = "varunneal/flash-attention-3"
-            return get_kernel(hf_kernel).flash_attn_interface
-        else:
-            hf_kernel = "kernels-community/flash-attn3"
-            if has_kernel(hf_kernel):
-                return get_kernel(hf_kernel).flash_attn_interface
-            else:
-                return None
-
+            return get_kernel("varunneal/flash-attention-3", revision="main", trust_remote_code=True).flash_attn_interface
+        hf_kernel = "kernels-community/flash-attn3"
+        for version in (2, 1):
+            if has_kernel(hf_kernel, version=version):
+                return get_kernel(hf_kernel, version=version).flash_attn_interface
+        return None
     except Exception:
         return None
 
@@ -49,26 +58,258 @@ def _load_flash_attention_3():
 _fa3 = _load_flash_attention_3()
 HAS_FA3 = _fa3 is not None
 
-# Override for testing: set to 'fa3', 'sdpa', or None (auto)
+
+# =============================================================================
+# Detection: Try to load FA2 via kernels-community/flash-attn2 (lazy, cached)
+# =============================================================================
+_fa2 = None
+_fa2_load_error = None
+_fa2_checked = False
+
+
+def _load_flash_attention_2():
+    """Try to load Flash Attention 2 (kernels-community/flash-attn2). Cached."""
+    global _fa2, _fa2_load_error, _fa2_checked
+    if _fa2_checked:
+        return _fa2
+    _fa2_checked = True
+    if not torch.cuda.is_available():
+        _fa2_load_error = "CUDA is not available"
+        return None
+    try:
+        from kernels import get_kernel, has_kernel
+        hf_kernel = "kernels-community/flash-attn2"
+        for version in (3, 2, 1):
+            if has_kernel(hf_kernel, version=version):
+                _fa2 = get_kernel(hf_kernel, version=version).flash_attn_interface
+                return _fa2
+        _fa2_load_error = "no compatible kernels-community/flash-attn2 build for this GPU/PyTorch version"
+    except Exception as e:
+        _fa2_load_error = f"failed to load kernels-community/flash-attn2: {type(e).__name__}: {e}"
+        _fa2 = None
+    return _fa2
+
+
+def has_fa2():
+    """Whether FA2 (kernels-community/flash-attn2) is available on this hardware."""
+    return _load_flash_attention_2() is not None
+
+
+# =============================================================================
+# Detection: Try to load FA4 via kernels-community/flash-attn4 (lazy, cached)
+# =============================================================================
+_fa4 = None            # the flash-attn4 interface module, once loaded
+_fa4_load_error = None  # reason FA4 could not be loaded (for error messages)
+_fa4_checked = False
+
+
+def _load_flash_attention_4():
+    """Try to load Flash Attention 4 (kernels-community/flash-attn4, CuTe DSL). Cached."""
+    global _fa4, _fa4_load_error, _fa4_checked
+    if _fa4_checked:
+        return _fa4
+    _fa4_checked = True
+    if not torch.cuda.is_available():
+        _fa4_load_error = "CUDA is not available"
+        return None
+    major, minor = torch.cuda.get_device_capability()
+    # FA4 CuTe kernels support sm80 (Ampere), sm90 (Hopper), sm100/sm110 (Blackwell DC), sm120 (Blackwell GeForce)
+    if major not in (8, 9, 10, 11, 12):
+        _fa4_load_error = f"unsupported compute capability sm{major}{minor}"
+        return None
+    try:
+        from kernels import get_kernel, has_kernel
+        hf_kernel = "kernels-community/flash-attn4"
+        if has_kernel(hf_kernel, version=1):
+            _fa4 = get_kernel(hf_kernel, version=1).interface
+        else:
+            _fa4_load_error = "no compatible kernels-community/flash-attn4 build found"
+    except Exception as e:
+        _fa4_load_error = f"failed to load kernels-community/flash-attn4: {type(e).__name__}: {e}"
+        _fa4 = None
+    return _fa4
+
+
+def has_fa4():
+    """Whether FA4 is installed and loadable on this hardware (triggers the lazy import)."""
+    return _load_flash_attention_4() is not None
+
+
+# =============================================================================
+# Backend resolution
+# =============================================================================
+# Override (e.g. for testing or CLI): 'fa4', 'fa3', 'fa2', 'sdpa', or None (auto / env var)
 _override_impl = None
 
 
-def _resolve_use_fa3():
-    """Decide once whether to use FA3, based on availability, override, and dtype."""
-    if _override_impl == 'fa3':
-        assert HAS_FA3, "Cannot override to FA3: not available on this hardware"
-        return True
-    if _override_impl == 'sdpa':
-        return False
-    if HAS_FA3:
-        # FA3 Hopper kernels only support bf16 and fp8; fp16/fp32 must use SDPA fallback
-        from nanochat.common import COMPUTE_DTYPE
-        if COMPUTE_DTYPE == torch.bfloat16:
-            return True
-        return False
-    return False
+def _requested_impl():
+    if _override_impl is not None:
+        return _override_impl
+    env = os.environ.get("NANOCHAT_ATTN_IMPL", "auto").strip().lower() or "auto"
+    assert env in VALID_IMPLS, f"Invalid NANOCHAT_ATTN_IMPL={env!r}, expected one of {VALID_IMPLS}"
+    return env
 
-USE_FA3 = _resolve_use_fa3()
+
+def _resolve_attn_impl():
+    """Decide once which attention backend to use, based on availability, override, and dtype."""
+    from nanochat.common import COMPUTE_DTYPE
+    requested = _requested_impl()
+    if requested == "sdpa":
+        return "sdpa"
+    if requested == "fa3":
+        assert HAS_FA3, "Cannot use FA3: not available on this hardware"
+        assert COMPUTE_DTYPE == torch.bfloat16, \
+            f"FA3 only supports bf16, but COMPUTE_DTYPE={COMPUTE_DTYPE}"
+        return "fa3"
+    if requested == "fa2":
+        assert has_fa2(), f"Cannot use FA2: {_fa2_load_error}"
+        assert COMPUTE_DTYPE in (torch.bfloat16, torch.float16), \
+            f"FA2 only supports bf16/fp16, but COMPUTE_DTYPE={COMPUTE_DTYPE}"
+        return "fa2"
+    if requested == "fa4":
+        assert has_fa4(), f"Cannot use FA4: {_fa4_load_error}"
+        assert COMPUTE_DTYPE in (torch.bfloat16, torch.float16), \
+            f"FA4 only supports bf16/fp16, but COMPUTE_DTYPE={COMPUTE_DTYPE}"
+        return "fa4"
+    # auto
+    # FA3 Hopper kernels only support bf16 and fp8; fp16/fp32 must use another backend
+    if HAS_FA3 and COMPUTE_DTYPE == torch.bfloat16:
+        return "fa3"
+    if COMPUTE_DTYPE in (torch.bfloat16, torch.float16):
+        # On datacenter Blackwell (sm100/sm110), FA4 uses native tcgen05/TMEM instructions;
+        # on consumer Blackwell (sm120) and older, FA2 C++ kernels are faster when available.
+        major = torch.cuda.get_device_capability()[0] if torch.cuda.is_available() else 0
+        if major in (10, 11) and has_fa4():
+            return "fa4"
+        if has_fa2():
+            return "fa2"
+        if has_fa4():
+            return "fa4"
+    return "sdpa"
+
+
+def _resolve_use_fa3():
+    """Backwards-compatible helper: whether the resolved backend is FA3."""
+    global ATTN_IMPL, USE_FA3, USE_FA4, USE_FA2
+    ATTN_IMPL = _resolve_attn_impl()
+    USE_FA3 = ATTN_IMPL == "fa3"
+    USE_FA4 = ATTN_IMPL == "fa4"
+    USE_FA2 = ATTN_IMPL == "fa2"
+    return USE_FA3
+
+
+try:
+    ATTN_IMPL = _resolve_attn_impl()
+except AssertionError:
+    # Defer hard failure on invalid/unavailable NANOCHAT_ATTN_IMPL until set_attn_impl()
+    # so CLI --attn-impl can take precedence over the environment variable.
+    ATTN_IMPL = "sdpa"
+USE_FA3 = ATTN_IMPL == "fa3"
+USE_FA4 = ATTN_IMPL == "fa4"
+USE_FA2 = ATTN_IMPL == "fa2"
+
+
+def set_attn_impl(impl):
+    """
+    Select the attention backend at runtime: 'fa4', 'fa3', 'fa2', 'sdpa', or 'auto'/None.
+    Must be called before the model is torch.compile'd / run. Returns the resolved backend.
+    """
+    global _override_impl, ATTN_IMPL, USE_FA3, USE_FA4, USE_FA2
+    if impl is not None:
+        impl = impl.strip().lower()
+        assert impl in VALID_IMPLS, f"Invalid attention impl {impl!r}, expected one of {VALID_IMPLS}"
+    _override_impl = None if impl in (None, "auto") else impl
+    ATTN_IMPL = _resolve_attn_impl()
+    USE_FA3 = ATTN_IMPL == "fa3"
+    USE_FA4 = ATTN_IMPL == "fa4"
+    USE_FA2 = ATTN_IMPL == "fa2"
+    return ATTN_IMPL
+
+
+ATTN_IMPL_NAMES = {
+    "fa3": "Flash Attention 3",
+    "fa4": "Flash Attention 4",
+    "fa2": "Flash Attention 2",
+    "sdpa": "PyTorch SDPA",
+}
+
+
+# =============================================================================
+# FA4 helpers
+# =============================================================================
+# FA4's autograd.Function is not traceable by torch.compile, so we expose its forward/backward
+# kernels as opaque torch.library custom ops. This keeps the compiled graph free of graph breaks.
+@torch.library.custom_op("nanochat::fa4_fwd", mutates_args=())
+def _fa4_fwd(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, causal: bool,
+             window_left: int | None, window_right: int | None) -> tuple[torch.Tensor, torch.Tensor]:
+    res = _fa4._flash_attn_fwd(
+        q, k, v, causal=causal,
+        window_size_left=window_left, window_size_right=window_right,
+        return_lse=True,
+    )
+    return res[0], res[1]  # out (B, T, H, D), lse (B, H, T) fp32
+
+
+@_fa4_fwd.register_fake
+def _(q, k, v, causal, window_left, window_right):
+    B, T, H, _ = q.shape
+    out = q.new_empty(B, T, H, v.shape[-1])
+    lse = q.new_empty(B, H, T, dtype=torch.float32)
+    return out, lse
+
+
+@torch.library.custom_op("nanochat::fa4_bwd", mutates_args=())
+def _fa4_bwd(dout: torch.Tensor, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
+             out: torch.Tensor, lse: torch.Tensor, causal: bool,
+             window_left: int | None, window_right: int | None) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    res = _fa4._flash_attn_bwd(
+        q, k, v, out, dout, lse, causal=causal,
+        window_size_left=window_left, window_size_right=window_right,
+    )
+    return res[0], res[1], res[2]
+
+
+@_fa4_bwd.register_fake
+def _(dout, q, k, v, out, lse, causal, window_left, window_right):
+    return torch.empty_like(q), torch.empty_like(k), torch.empty_like(v)
+
+
+def _fa4_setup_context(ctx, inputs, output):
+    q, k, v, causal, window_left, window_right = inputs
+    out, lse = output
+    ctx.save_for_backward(q, k, v, out, lse)
+    ctx.causal = causal
+    ctx.window_left = window_left
+    ctx.window_right = window_right
+
+
+def _fa4_backward(ctx, dout, dlse):
+    q, k, v, out, lse = ctx.saved_tensors
+    dq, dk, dv = _fa4_bwd(dout.contiguous(), q, k, v, out, lse, ctx.causal, ctx.window_left, ctx.window_right)
+    return dq, dk, dv, None, None, None
+
+
+_fa4_fwd.register_autograd(_fa4_backward, setup_context=_fa4_setup_context)
+
+
+def _fa4_window(window_size, Tk):
+    """
+    Convert FA3-style window_size (left, right) with -1 = unlimited into FA4-style (None = unlimited).
+    A left window that covers the whole key sequence is dropped so FA4 uses its faster pure-causal path.
+    """
+    left, right = window_size
+    left = None if (left is None or left < 0 or left >= Tk - 1) else left
+    right = None if (right is None or right < 0) else right
+    return left, right
+
+
+def _fa4_attention(q, k, v, causal, window_size):
+    """q, k, v are (B, T, H, D). Returns (B, Tq, H, D)."""
+    left, right = _fa4_window(window_size, k.size(1))
+    if causal:
+        right = None  # implied by causal; lets FA4 pick the pure-causal kernel when left is None too
+    out, _ = _fa4_fwd(q, k, v, causal, left, right)
+    return out
 
 
 # =============================================================================
@@ -124,8 +365,12 @@ def flash_attn_func(q, k, v, causal=False, window_size=(-1, -1)):
     Returns:
         Output tensor of shape (B, T, H, D)
     """
-    if USE_FA3:
+    if ATTN_IMPL == "fa3":
         return _fa3.flash_attn_func(q, k, v, causal=causal, window_size=window_size)
+    if ATTN_IMPL == "fa2":
+        return _fa2.flash_attn_func(q, k, v, causal=causal, window_size=window_size)
+    if ATTN_IMPL == "fa4":
+        return _fa4_attention(q, k, v, causal, window_size)
 
     # SDPA fallback: transpose (B, T, H, D) -> (B, H, T, D)
     q = q.transpose(1, 2)
@@ -141,7 +386,7 @@ def flash_attn_with_kvcache(q, k_cache, v_cache, k=None, v=None, cache_seqlens=N
     """
     Flash Attention with KV cache for inference.
 
-    FA3 updates k_cache/v_cache in-place. Our SDPA fallback does the same.
+    FA3 and FA2 update k_cache/v_cache in-place. Our FA4 and SDPA paths do the same.
 
     Args:
         q: Queries, shape (B, T_new, H, D)
@@ -154,13 +399,18 @@ def flash_attn_with_kvcache(q, k_cache, v_cache, k=None, v=None, cache_seqlens=N
     Returns:
         Output tensor of shape (B, T_new, H, D)
     """
-    if USE_FA3:
+    if ATTN_IMPL == "fa3":
         return _fa3.flash_attn_with_kvcache(
             q, k_cache, v_cache, k=k, v=v, cache_seqlens=cache_seqlens,
             causal=causal, window_size=window_size
         )
+    if ATTN_IMPL == "fa2":
+        return _fa2.flash_attn_with_kvcache(
+            q, k_cache, v_cache, k=k, v=v, cache_seqlens=cache_seqlens,
+            causal=causal, window_size=window_size
+        )
 
-    # SDPA fallback: manually manage KV cache
+    # FA4 / SDPA: manually manage KV cache
     B, T_new, H, D = q.shape
     pos = cache_seqlens[0].item()  # assume uniform position across batch
 
@@ -173,6 +423,10 @@ def flash_attn_with_kvcache(q, k_cache, v_cache, k=None, v=None, cache_seqlens=N
     end_pos = pos + T_new
     k_full = k_cache[:, :end_pos, :, :]
     v_full = v_cache[:, :end_pos, :, :]
+
+    if ATTN_IMPL == "fa4":
+        # FA4 has no kvcache API; causal masking is bottom-right aligned when Tq != Tk, matching FA3
+        return _fa4_attention(q, k_full, v_full, causal, window_size)
 
     # Transpose to SDPA layout: (B, T, H, D) -> (B, H, T, D)
     q_sdpa = q.transpose(1, 2)

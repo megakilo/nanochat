@@ -21,8 +21,8 @@ from nanochat.tokenizer import get_token_bytes
 from nanochat.checkpoint_manager import save_checkpoint, load_model, load_optimizer_state
 from nanochat.loss_eval import evaluate_bpb
 import torch.distributed as dist
-from nanochat.flash_attention import HAS_FA3
 from nanochat.engine import Engine
+from nanochat.flash_attention import VALID_IMPLS, set_attn_impl, ATTN_IMPL_NAMES
 from scripts.chat_eval import run_chat_eval
 
 from tasks.common import TaskMixture
@@ -37,6 +37,7 @@ parser = argparse.ArgumentParser(description="Supervised fine-tuning (SFT) the m
 parser.add_argument("--run", type=str, default="dummy", help="wandb run name ('dummy' disables wandb logging)")
 # Runtime
 parser.add_argument("--device-type", type=str, default="", help="cuda|cpu|mps (empty = autodetect)")
+parser.add_argument("--attn-impl", type=str, default=None, choices=VALID_IMPLS, help="attention backend (default: $NANOCHAT_ATTN_IMPL or auto)")
 # Model loading
 parser.add_argument("--model-tag", type=str, default=None, help="model tag to load from")
 parser.add_argument("--model-step", type=int, default=None, help="model step to load from")
@@ -82,13 +83,17 @@ if device_type == "cuda":
 else:
     gpu_peak_flops = float('inf')  # MFU not meaningful for CPU/MPS
 
+# Flash Attention status
+attn_impl = set_attn_impl(args.attn_impl)  # None => $NANOCHAT_ATTN_IMPL or auto
+user_config["attn_impl"] = attn_impl
+if attn_impl == "sdpa":
+    print0("WARNING: Flash Attention 2/3/4 not available (or SDPA requested), using PyTorch SDPA fallback. Training will be less efficient.")
+else:
+    print0(f"✓ Using {ATTN_IMPL_NAMES[attn_impl]}")
+
 # wandb logging init
 use_dummy_wandb = args.run == "dummy" or not master_process
 wandb_run = DummyWandb() if use_dummy_wandb else wandb.init(project="nanochat-sft", name=args.run, config=user_config)
-
-# Flash Attention status
-if not HAS_FA3:
-    print0("WARNING: Flash Attention 3 not available, using PyTorch SDPA fallback. Training will be less efficient.")
 
 # Load the model and tokenizer
 model, tokenizer, meta = load_model("base", device, phase="train", model_tag=args.model_tag, step=args.model_step)

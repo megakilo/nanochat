@@ -32,7 +32,7 @@ See [dev/LEADERBOARD.md](dev/LEADERBOARD.md) for more docs on how to interpret a
 nanochat uses [uv](https://docs.astral.sh/uv/) for dependency management. To install:
 
 ```bash
-uv sync --extra gpu    # Use for CUDA (A100/H100/etc.)
+uv sync --extra gpu    # Use for CUDA (A100/H100/Blackwell/etc.)
 uv sync --extra cpu    # (or) Use for CPU-only / MPS
 source .venv/bin/activate
 ```

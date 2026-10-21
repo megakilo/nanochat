@@ -6,7 +6,7 @@ readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "filelock>=3.19.0",
-    "kernels>=0.11.7",
+    "kernels>=0.17.2",
     "numpy>=1.26.0",
     "psutil>=7.1.0",
     "pyarrow>=21.0.0",
@@ -57,6 +57,11 @@ cpu = [
 ]
 gpu = [
     "torch==2.14.1",
+    # Python runtime deps for kernels-community/flash-attn4 (CuTe DSL)
+    "nvidia-cutlass-dsl[cu13]>=4.6.2",
+    "apache-tvm-ffi>=0.1.11,<0.2",
+    "einops>=0.8.0",
+    "torch-c-dlpack-ext",
 ]
 
 [tool.uv]

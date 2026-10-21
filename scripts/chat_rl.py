@@ -25,6 +25,7 @@ import torch.distributed as dist
 from nanochat.common import compute_init, compute_cleanup, print0, get_base_dir, DummyWandb, autodetect_device_type
 from nanochat.checkpoint_manager import save_checkpoint, load_model
 from nanochat.engine import Engine
+from nanochat.flash_attention import VALID_IMPLS, set_attn_impl, ATTN_IMPL_NAMES
 from tasks.gsm8k import GSM8K
 
 # -----------------------------------------------------------------------------
@@ -34,6 +35,7 @@ parser = argparse.ArgumentParser(description="Reinforcement learning on GSM8K")
 parser.add_argument("--run", type=str, default="dummy", help="wandb run name ('dummy' disables wandb logging)")
 # Runtime
 parser.add_argument("--device-type", type=str, default="", help="cuda|cpu|mps (empty = autodetect)")
+parser.add_argument("--attn-impl", type=str, default=None, choices=VALID_IMPLS, help="attention backend (default: $NANOCHAT_ATTN_IMPL or auto)")
 # Model loading
 parser.add_argument("--model-tag", type=str, default=None, help="model tag to load from")
 parser.add_argument("--model-step", type=int, default=None, help="model step to load from")
@@ -65,6 +67,14 @@ user_config = vars(args).copy()
 device_type = autodetect_device_type() if args.device_type == "" else args.device_type
 ddp, ddp_rank, ddp_local_rank, ddp_world_size, device = compute_init(device_type)
 master_process = ddp_rank == 0 # this process will do logging, checkpointing etc.
+
+# Flash Attention status
+attn_impl = set_attn_impl(args.attn_impl)  # None => $NANOCHAT_ATTN_IMPL or auto
+user_config["attn_impl"] = attn_impl
+if attn_impl == "sdpa":
+    print0("WARNING: Flash Attention 2/3/4 not available (or SDPA requested), using PyTorch SDPA fallback.")
+else:
+    print0(f"✓ Using {ATTN_IMPL_NAMES[attn_impl]}")
 
 # wandb logging init
 use_dummy_wandb = args.run == "dummy" or not master_process
