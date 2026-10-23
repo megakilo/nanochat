@@ -235,6 +235,8 @@ def get_peak_flops(device_name: str) -> float:
         (["grace blackwell"], 2.5e15),
         (["b200"], 2.25e15),
         (["b100"], 1.8e15),
+        (["rtx", "pro", "6000"], 503.8e12),
+        (["6000", "blackwell"], 503.8e12),
         # NVIDIA Hopper
         (["h200", "nvl"], 836e12),
         (["h200", "pcie"], 836e12),
@@ -286,11 +288,15 @@ def get_peak_bandwidth(device_name: str) -> float:
 
     # Table order matters: more specific patterns first.
     _PEAK_BANDWIDTH_TABLE = (
-        # NVIDIA Blackwell (HBM3e)
+        # NVIDIA Blackwell (HBM3e / GDDR7)
         (["gb200"], 8.0e12),
         (["grace blackwell"], 8.0e12),
         (["b200"], 8.0e12),
         (["b100"], 8.0e12),
+        (["rtx", "pro", "6000", "server"], 1.6e12),
+        (["6000", "blackwell", "server"], 1.6e12),
+        (["rtx", "pro", "6000"], 1.79e12),
+        (["6000", "blackwell"], 1.79e12),
         # NVIDIA Hopper
         (["h200"], 4.8e12),
         (["h100", "nvl"], 3.9e12),
