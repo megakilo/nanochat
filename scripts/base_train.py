@@ -27,7 +27,7 @@ import torch.distributed as dist
 
 from nanochat.gpt import GPT, GPTConfig, Linear
 from nanochat.dataloader import tokenizing_distributed_data_loader_bos_bestfit, tokenizing_distributed_data_loader_with_state_bos_bestfit
-from nanochat.common import compute_init, compute_cleanup, print0, DummyWandb, print_banner, get_base_dir, autodetect_device_type, get_peak_flops, COMPUTE_DTYPE, COMPUTE_DTYPE_REASON, is_ddp_initialized
+from nanochat.common import compute_init, compute_cleanup, print0, DummyWandb, print_banner, get_base_dir, autodetect_device_type, get_peak_flops, get_device_name, compile_model, device_synchronize, device_peak_memory, COMPUTE_DTYPE, COMPUTE_DTYPE_REASON, is_ddp_initialized
 from nanochat.tokenizer import get_tokenizer, get_token_bytes
 from nanochat.checkpoint_manager import save_checkpoint, load_checkpoint
 from nanochat.loss_eval import evaluate_bpb
@@ -42,7 +42,7 @@ parser = argparse.ArgumentParser(description="Pretrain base model")
 # Logging
 parser.add_argument("--run", type=str, default="dummy", help="wandb run name ('dummy' disables wandb logging)")
 # Runtime
-parser.add_argument("--device-type", type=str, default="", help="cuda|cpu|mps (empty = autodetect)")
+parser.add_argument("--device-type", type=str, default="", help="cuda|cpu|mps|tpu (empty = autodetect)")
 parser.add_argument("--attn-impl", type=str, default=None, choices=VALID_IMPLS, help="attention backend (default: $NANOCHAT_ATTN_IMPL or auto)")
 # FP8 training
 parser.add_argument("--fp8", action="store_true", help="enable FP8 training (requires H100+ GPU)")
@@ -86,12 +86,13 @@ user_config = vars(args).copy()  # for logging
 device_type = autodetect_device_type() if args.device_type == "" else args.device_type
 ddp, ddp_rank, ddp_local_rank, ddp_world_size, device = compute_init(device_type)
 master_process = ddp_rank == 0 # this process will do logging, checkpointing etc.
-synchronize = torch.cuda.synchronize if device_type == "cuda" else lambda: None
-get_max_memory = torch.cuda.max_memory_allocated if device_type == "cuda" else lambda: 0
-if device_type == "cuda":
-    gpu_device_name = torch.cuda.get_device_name(0)
-    gpu_peak_flops = get_peak_flops(gpu_device_name)
-    print0(f"GPU: {gpu_device_name} | Peak FLOPS (BF16): {gpu_peak_flops:.2e}")
+synchronize = device_synchronize(device_type)
+get_max_memory = device_peak_memory(device_type)
+if device_type in ("cuda", "tpu"):
+    accel_name = get_device_name(device_type)
+    gpu_peak_flops = get_peak_flops(accel_name)
+    kind = "GPU" if device_type == "cuda" else "TPU"
+    print0(f"{kind}: {accel_name} | Peak FLOPS (BF16): {gpu_peak_flops:.2e}")
 else:
     gpu_peak_flops = float('inf')  # MFU not meaningful for CPU/MPS
 print0(f"COMPUTE_DTYPE: {COMPUTE_DTYPE} ({COMPUTE_DTYPE_REASON})")
@@ -110,6 +111,8 @@ elif attn_impl == "fa4":
     print0("✓ Using Flash Attention 4 (CuTe DSL): efficient, newer and awesome. First steps include kernel JIT compilation.")
 elif attn_impl == "fa2":
     print0("✓ Using Flash Attention 2 (kernels-community/flash-attn2): efficient and fast.")
+elif attn_impl == "splash":
+    print0("✓ Using Splash Attention (TorchTPU Pallas kernel).")
 else:
     print0("!" * 80)
     if HAS_FA3 and COMPUTE_DTYPE != torch.bfloat16:
@@ -249,7 +252,7 @@ def disable_fp8(model):
 # Compile the model
 
 orig_model = model # original, uncompiled model, for saving raw model state_dict and for inference/evaluation (because the shapes may change shape)
-model = torch.compile(model, dynamic=False) # the inputs to model will never change shape so dynamic=False is safe
+model = compile_model(model, dynamic=False) # the inputs to model will never change shape so dynamic=False is safe
 
 # -----------------------------------------------------------------------------
 # Scaling laws and muP extrapolations to determine the optimal training horizon, batch size, learning rates, weight decay.

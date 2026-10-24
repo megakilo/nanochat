@@ -1,0 +1,170 @@
+"""Splash Attention helpers and TPU backend selection.
+
+These tests do not need a TPU. They cover the shape rules the Pallas kernel
+imposes (tiles of 128) and that auto-selection does not pick Splash on a
+machine without TorchTPU.
+"""
+
+import pytest
+import torch
+
+from nanochat.common import get_peak_flops, tpu_is_available
+from nanochat.flash_attention import VALID_IMPLS, set_attn_impl
+from nanochat.splash_attention import splash_local_window, splash_shapes_ok
+import nanochat.flash_attention as fa_module
+
+
+def test_valid_impls_include_splash():
+    assert "splash" in VALID_IMPLS
+
+
+def test_splash_shapes():
+    assert splash_shapes_ok(2048, 2048)
+    assert splash_shapes_ok(128, 512)
+    assert splash_shapes_ok(512, 768)
+    assert splash_shapes_ok(2048, 2048, head_dim=128)
+    assert splash_shapes_ok(2048, 2048, head_dim=256)
+    # Decode writes one query against a long cache. 1 is not a Splash tile.
+    assert not splash_shapes_ok(1, 2048)
+    assert not splash_shapes_ok(64, 64)
+    assert not splash_shapes_ok(192, 192)
+    assert not splash_shapes_ok(2048, 2048, head_dim=64)
+    assert not splash_shapes_ok(2048, 2048, head_dim=32)
+
+
+def test_splash_non_causal_fallback_is_bidirectional():
+    q = torch.randn(1, 16, 2, 32)
+    k = torch.randn(1, 16, 2, 32)
+    v = torch.randn(1, 16, 2, 32)
+    out = fa_module._splash_bthd(q, k, v, causal=False, window_size=(-1, -1))
+    ref = torch.nn.functional.scaled_dot_product_attention(
+        q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), is_causal=False
+    ).transpose(1, 2)
+    torch.testing.assert_close(out, ref)
+
+
+def test_splash_kvcache_fallback_does_not_warn(monkeypatch):
+    monkeypatch.setattr(fa_module, "_splash_fallback_warned", False)
+    q = torch.randn(1, 1, 2, 128)
+    k = torch.randn(1, 17, 2, 128)
+    v = torch.randn(1, 17, 2, 128)
+    _ = fa_module._splash_bthd(q, k, v, causal=True, window_size=(-1, 0), warn_on_fallback=False)
+    assert fa_module._splash_fallback_warned is False
+
+
+def test_splash_local_window():
+    # Full-context causal (left covers every key) stays on the pure causal kernel.
+    assert splash_local_window((2048, 0), kv_len=2048) is None
+    assert splash_local_window((-1, 0), kv_len=2048) is None
+    assert splash_local_window((2047, 0), kv_len=2048) is None
+    # Short window is passed through. 768 is the quarter-context tile at seq 2048.
+    assert splash_local_window((768, 0), kv_len=2048) == 768
+    assert splash_local_window((0, 0), kv_len=128) == 0
+
+
+def test_splash_requires_tpu():
+    if tpu_is_available():
+        pytest.skip("TPU is available; this checks the missing-device error")
+    with pytest.raises(AssertionError, match="Splash Attention"):
+        set_attn_impl("splash")
+    set_attn_impl(None)
+    assert fa_module.ATTN_IMPL != "splash"
+    assert fa_module.USE_SPLASH is False
+
+
+def test_tpu_peak_flops_do_not_steal_gpu_names():
+    assert get_peak_flops("TPU v6e") == 918e12
+    assert get_peak_flops("tpu v5p") == 459e12
+    assert get_peak_flops("v5litepod-16") == 197e12
+    assert get_peak_flops("Ironwood") == 4.614e15
+    # A GPU name must still resolve to the GPU table, not a TPU substring.
+    assert get_peak_flops("NVIDIA H100 80GB HBM3") == 989e12
+
+
+def test_compile_model_leaves_cpu_backend_default(monkeypatch):
+    from nanochat.common import compile_model
+    captured = {}
+
+    def fake_compile(model, **kwargs):
+        captured.update(kwargs)
+        return model
+
+    monkeypatch.setattr(torch, "compile", fake_compile)
+    layer = torch.nn.Linear(4, 4)
+    assert compile_model(layer) is layer
+    assert captured == {"dynamic": False}
+
+
+def test_dataloader_device_buffers_own_storage():
+    from nanochat.dataloader import _allocate_token_buffers
+
+    B, T = 4, 2048
+    cpu_inputs, cpu_targets, inputs, targets = _allocate_token_buffers(
+        B, T, device="cpu", pin_memory=False
+    )
+    assert cpu_inputs.shape == (B, T)
+    assert cpu_targets.shape == (B, T)
+    assert inputs.untyped_storage().data_ptr() != targets.untyped_storage().data_ptr()
+    for t in (inputs, targets):
+        assert not t._is_view()
+        assert t.shape == (B, T)
+        assert t.dtype == torch.long
+        assert t.storage_offset() == 0
+        assert t.untyped_storage().size() == B * T * t.element_size()
+
+
+def test_splash_mixed_windows_compile_single_graph(monkeypatch):
+    import types
+    import nanochat.splash_attention as sa
+
+    def fake_make_splash(**_kwargs):
+        def fwd(q, k, v):
+            return q.clone(), torch.zeros(q.shape[:-1], dtype=torch.float32, device=q.device)
+
+        def bwd(q, k, v, out, lse, g):
+            return g.clone(), k.clone(), v.clone()
+
+        return fwd, bwd
+
+    def fake_jax_op(qualname, fn):
+        if "_fwd_" in qualname:
+            @torch.library.custom_op(qualname, mutates_args=())
+            def op(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+                return fn(q, k, v)
+
+            @op.register_fake
+            def _(q, k, v):
+                return q.new_empty(q.shape), q.new_empty(q.shape[:-1], dtype=torch.float32)
+
+            return op
+
+        @torch.library.custom_op(qualname, mutates_args=())
+        def bwd_op(
+            q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
+            out: torch.Tensor, lse: torch.Tensor, g: torch.Tensor,
+        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+            return fn(q, k, v, out, lse, g)
+
+        @bwd_op.register_fake
+        def _(q, k, v, out, lse, g):
+            return q.new_empty(q.shape), k.new_empty(k.shape), v.new_empty(v.shape)
+
+        return bwd_op
+
+    monkeypatch.setattr(sa, "_make_splash_attention_fn", fake_make_splash)
+    monkeypatch.setattr(sa, "_splash_fwd_ops", {})
+    monkeypatch.setattr(sa, "_splash_ops", types.SimpleNamespace())
+    monkeypatch.setattr(
+        torch, "tpu", types.SimpleNamespace(pallas=types.SimpleNamespace(jax_op=fake_jax_op)), raising=False
+    )
+
+    def mixed_window_fn(q, k, v):
+        y = sa.splash_sdpa(q, k, v, is_causal=True, local_window_size=128)
+        y = sa.splash_sdpa(y, k, v, is_causal=True, local_window_size=None)
+        return y
+
+    q = torch.randn(2, 2, 512, 128)
+    explanation = torch._dynamo.explain(mixed_window_fn)(q, q, q)
+    assert explanation.graph_count == 1
+    assert explanation.graph_break_count == 0
+

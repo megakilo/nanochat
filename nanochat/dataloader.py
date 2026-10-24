@@ -71,6 +71,23 @@ def _document_batches(split, resume_state_dict, tokenizer_batch_size):
         epoch += 1
 
 
+def _allocate_token_buffers(B, T, device, pin_memory):
+    """Allocate pinned CPU staging and owning device tensors for a (B, T) batch.
+
+    Device inputs/targets must own their (B, T) storage rather than slicing a
+    single packed 2*B*T device buffer: TorchTPU's compiler can record the base
+    2*B*T buffer on a slice view during graph lowering and then fail with
+    RuntimeProgramInputMismatch when the materialized B*T tensor is passed to
+    embedding_dense_backward.
+    """
+    cpu_buffer = torch.empty(2 * B * T, dtype=torch.long, pin_memory=pin_memory)
+    cpu_inputs = cpu_buffer[:B * T].view(B, T)
+    cpu_targets = cpu_buffer[B * T:].view(B, T)
+    inputs = torch.empty((B, T), dtype=torch.long, device=device)
+    targets = torch.empty((B, T), dtype=torch.long, device=device)
+    return cpu_inputs, cpu_targets, inputs, targets
+
+
 def tokenizing_distributed_data_loader_with_state_bos_bestfit(
     tokenizer, B, T, split,
     tokenizer_threads=4, tokenizer_batch_size=128,
@@ -108,16 +125,12 @@ def tokenizing_distributed_data_loader_with_state_bos_bestfit(
         for tokens in token_lists:
             doc_buffer.append(tokens)
 
-    # Pre-allocate buffers once: layout is [inputs (B*T) | targets (B*T)]
-    # This gives us contiguous views and a single HtoD transfer
-    use_cuda = device == "cuda"
+    # Pre-allocate staging and device buffers once (see _allocate_token_buffers).
+    # Compare on device.type so cuda:0 and tpu both pin the staging buffer.
+    device_type = device.type if isinstance(device, torch.device) else str(device).split(":")[0]
+    use_accel = device_type in ("cuda", "tpu")
     row_buffer = torch.empty((B, row_capacity), dtype=torch.long) # for building rows without creating Python lists
-    cpu_buffer = torch.empty(2 * B * T, dtype=torch.long, pin_memory=use_cuda) # staging area (CPU)
-    gpu_buffer = torch.empty(2 * B * T, dtype=torch.long, device=device) # on-device buffer
-    cpu_inputs = cpu_buffer[:B * T].view(B, T) # a few views into these buffers just for convenience
-    cpu_targets = cpu_buffer[B * T:].view(B, T)
-    inputs = gpu_buffer[:B * T].view(B, T)
-    targets = gpu_buffer[B * T:].view(B, T)
+    cpu_inputs, cpu_targets, inputs, targets = _allocate_token_buffers(B, T, device, pin_memory=use_accel)
 
     while True:
         for row_idx in range(B):
@@ -150,14 +163,14 @@ def tokenizing_distributed_data_loader_with_state_bos_bestfit(
                     row_buffer[row_idx, pos:pos + remaining] = torch.tensor(doc[:remaining], dtype=torch.long)
                     pos += remaining
 
-        # Copy to pinned CPU buffer, then single HtoD transfer
+        # Copy to pinned CPU buffers, then HtoD into owning device tensors
         cpu_inputs.copy_(row_buffer[:, :-1])
         cpu_targets.copy_(row_buffer[:, 1:])
 
         state_dict = {"pq_idx": pq_idx, "rg_idx": rg_idx, "epoch": epoch}
 
-        # Single HtoD copy into persistent GPU buffer and yield
-        gpu_buffer.copy_(cpu_buffer, non_blocking=use_cuda)
+        inputs.copy_(cpu_inputs, non_blocking=use_accel)
+        targets.copy_(cpu_targets, non_blocking=use_accel)
         yield inputs, targets, state_dict
 
 def tokenizing_distributed_data_loader_bos_bestfit(*args, **kwargs):

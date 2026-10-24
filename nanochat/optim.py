@@ -9,10 +9,46 @@ Adapted from: https://github.com/KellerJordan/modded-nanogpt
 Further contributions from @karpathy and @chrisjmccormick.
 """
 
+import functools
+
 import torch
 import torch.distributed as dist
 from torch import Tensor
 from nanochat.common import COMPUTE_DTYPE
+
+
+def _compile_step(fn):
+    """Compile a fused optimizer step. TPU tensors use backend='tpu'; everything else stays on the default.
+
+    Hyperparameter scalars are 0-D CPU tensors so a changing lr or step count is a new
+    value in the same graph, not a recompile. The TPU backend rejects CPU arguments, so
+    those scalars are copied onto the parameter device before the compiled call.
+    """
+    compiled = {}
+
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        device_type = "cpu"
+        device = None
+        for arg in args:
+            if isinstance(arg, Tensor) and arg.device.type != "cpu":
+                device_type = arg.device.type
+                device = arg.device
+                break
+        if device_type == "tpu":
+            args = tuple(
+                arg.to(device) if isinstance(arg, Tensor) and arg.device.type == "cpu" else arg
+                for arg in args
+            )
+        key = "tpu" if device_type == "tpu" else "default"
+        if key not in compiled:
+            options = {"dynamic": False, "fullgraph": True}
+            if key == "tpu":
+                options["backend"] = "tpu"
+            compiled[key] = torch.compile(fn, **options)
+        return compiled[key](*args, **kwargs)
+
+    return wrapper
 
 # -----------------------------------------------------------------------------
 """
@@ -20,7 +56,7 @@ Good old AdamW optimizer, fused kernel.
 https://arxiv.org/abs/1711.05101
 """
 
-@torch.compile(dynamic=False, fullgraph=True)
+@_compile_step
 def adamw_step_fused(
     p: Tensor,              # (32768, 768) - parameter tensor
     grad: Tensor,           # (32768, 768) - gradient, same shape as p
@@ -37,6 +73,7 @@ def adamw_step_fused(
     Fused AdamW step: weight_decay -> momentum_update -> bias_correction -> param_update
     All in one compiled graph to eliminate Python overhead between ops.
     The 0-D CPU tensors avoid recompilation when hyperparameter values change.
+    On TPU the compile wrapper copies them onto the parameter device.
     """
     # Some params (wte, value_embeds) are stored in bf16, so do the math in fp32 and
     # cast back at the end. MPS errors on mixed-dtype ops (CUDA promotes them), and
@@ -108,7 +145,7 @@ polar_express_coeffs = [
 ]
 
 
-@torch.compile(dynamic=False, fullgraph=True)
+@_compile_step
 def muon_step_fused(
     stacked_grads: Tensor,          # (12, 768, 3072) - stacked gradients
     stacked_params: Tensor,         # (12, 768, 3072) - stacked parameters
@@ -125,6 +162,7 @@ def muon_step_fused(
     Fused Muon step: momentum -> polar_express -> variance_reduction -> cautious_update
     All in one compiled graph to eliminate Python overhead between ops.
     Some of the constants are 0-D CPU tensors to avoid recompilation when values change.
+    On TPU the compile wrapper copies them onto the parameter device.
     """
 
     # Nesterov momentum

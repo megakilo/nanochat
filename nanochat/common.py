@@ -10,6 +10,21 @@ import torch
 import torch.distributed as dist
 from filelock import FileLock
 
+def tpu_is_available() -> bool:
+    """True when TorchTPU is installed and a TPU device is visible.
+
+    Importing torch_tpu registers the ``tpu`` backend with PyTorch. A missing
+    package or a machine without a chip both report unavailable.
+    """
+    try:
+        import torch_tpu  # noqa: F401  registers torch.tpu
+    except ImportError:
+        return False
+    accelerator = torch.accelerator.current_accelerator()
+    if accelerator is None or accelerator.type != "tpu":
+        return False
+    return torch.accelerator.is_available()
+
 # The dtype used for compute (matmuls, activations). Master weights stay fp32 for optimizer precision.
 # Linear layers cast their weights to this dtype in forward, replacing torch.amp.autocast.
 # Override with NANOCHAT_DTYPE env var: "bfloat16", "float16", "float32"
@@ -27,8 +42,11 @@ def _detect_compute_dtype():
         # fp16 training requires GradScaler (not yet implemented), so fall back to fp32.
         # Users can still force fp16 via NANOCHAT_DTYPE=float16 if they know what they're doing.
         return torch.float32, f"auto-detected: CUDA SM {capability[0]}{capability[1]} (pre-Ampere, bf16 not supported, using fp32)"
+    if tpu_is_available():
+        # TPU MXUs compute in bf16. fp32 is available via NANOCHAT_DTYPE=float32.
+        return torch.bfloat16, "auto-detected: TPU (bf16 MXU)"
     # Note: MPS on recent macOS also handles bf16 fine, opt in via NANOCHAT_DTYPE=bfloat16
-    return torch.float32, "auto-detected: no CUDA (CPU/MPS)"
+    return torch.float32, "auto-detected: no CUDA/TPU (CPU/MPS)"
 COMPUTE_DTYPE, COMPUTE_DTYPE_REASON = _detect_compute_dtype()
 
 class ColoredFormatter(logging.Formatter):
@@ -161,9 +179,11 @@ def get_dist_info():
         return False, 0, 0, 1
 
 def autodetect_device_type():
-    # prefer to use CUDA if available, otherwise use MPS, otherwise fallback on CPU
+    # prefer CUDA, then TPU (TorchTPU), then MPS, otherwise CPU
     if torch.cuda.is_available():
         device_type = "cuda"
+    elif tpu_is_available():
+        device_type = "tpu"
     elif torch.backends.mps.is_available():
         device_type = "mps"
     else:
@@ -171,14 +191,18 @@ def autodetect_device_type():
     print0(f"Autodetected device type: {device_type}")
     return device_type
 
-def compute_init(device_type="cuda"): # cuda|cpu|mps
+def compute_init(device_type="cuda"): # cuda|cpu|mps|tpu
     """Basic initialization that we keep doing over and over, so make common."""
 
-    assert device_type in ["cuda", "mps", "cpu"], "Invalid device type atm"
+    assert device_type in ["cuda", "mps", "cpu", "tpu"], "Invalid device type atm"
     if device_type == "cuda":
         assert torch.cuda.is_available(), "Your PyTorch installation is not configured for CUDA but device_type is 'cuda'"
     if device_type == "mps":
         assert torch.backends.mps.is_available(), "Your PyTorch installation is not configured for MPS but device_type is 'mps'"
+    if device_type == "tpu":
+        # Importing the package registers the tpu device and the tpu_dist backend.
+        import torch_tpu  # noqa: F401
+        assert tpu_is_available(), "TorchTPU is installed but no TPU is visible. device_type is 'tpu'"
 
     # Reproducibility
     # Note that we set the global seeds here, but most of the code uses explicit rng objects.
@@ -186,6 +210,8 @@ def compute_init(device_type="cuda"): # cuda|cpu|mps
     torch.manual_seed(42)
     if device_type == "cuda":
         torch.cuda.manual_seed(42)
+    elif device_type == "tpu":
+        torch.tpu.manual_seed(42)
     # skipping full reproducibility for now, possibly investigate slowdown later
     # torch.use_deterministic_algorithms(True)
 
@@ -193,13 +219,23 @@ def compute_init(device_type="cuda"): # cuda|cpu|mps
     if device_type == "cuda":
         torch.set_float32_matmul_precision("high") # uses tf32 instead of fp32 for matmuls, see https://docs.pytorch.org/docs/stable/generated/torch.set_float32_matmul_precision.html
 
-    # Distributed setup: Distributed Data Parallel (DDP), optional, and requires CUDA
+    # Distributed setup. CUDA uses NCCL; TPU uses TorchTPU's tpu_dist process group.
+    # Launch a TPU job with one process per chip, after:
+    #   eval $(python -m torch.tpu.distributed | sed 's/^/export /')
     is_ddp_requested, ddp_rank, ddp_local_rank, ddp_world_size = get_dist_info()
     if is_ddp_requested and device_type == "cuda":
         device = torch.device("cuda", ddp_local_rank)
         torch.cuda.set_device(device)  # make "cuda" default to this device
         dist.init_process_group(backend="nccl", device_id=device)
         dist.barrier()
+    elif is_ddp_requested and device_type == "tpu":
+        # One process per chip. The launch helper pins TPU_VISIBLE_CHIPS, so
+        # the process's only device is "tpu" (not "tpu:<local_rank>").
+        device = torch.device("tpu")
+        dist.init_process_group(backend="tpu_dist")
+        dist.barrier()
+    elif device_type == "tpu":
+        device = torch.device("tpu")
     else:
         device = torch.device(device_type) # mps|cpu
 
@@ -207,6 +243,42 @@ def compute_init(device_type="cuda"): # cuda|cpu|mps
         logger.info(f"Distributed world size: {ddp_world_size}")
 
     return is_ddp_requested, ddp_rank, ddp_local_rank, ddp_world_size, device
+
+def compile_model(model, *, dynamic=False, **kwargs):
+    """torch.compile a module. TPU uses the TorchTPU backend; other devices keep the default."""
+    try:
+        device_type = next(model.parameters()).device.type
+    except StopIteration:
+        device_type = "cpu"
+    if device_type == "tpu":
+        kwargs.setdefault("backend", "tpu")
+    return torch.compile(model, dynamic=dynamic, **kwargs)
+
+def device_synchronize(device_type):
+    """Device-wide sync callable. No-op on CPU and MPS."""
+    if device_type == "cuda":
+        return torch.cuda.synchronize
+    if device_type == "tpu":
+        # Current TorchTPU maps cuda.synchronize here. torch.tpu.synchronize is the pre-2.11 name.
+        return torch.accelerator.synchronize
+    return lambda *args, **kwargs: None
+
+def device_peak_memory(device_type):
+    """Peak allocator bytes, or a zero callable when the backend does not report it."""
+    if device_type == "cuda":
+        return torch.cuda.max_memory_allocated
+    if device_type == "tpu":
+        # torch.tpu has no memory stats; TorchTPU's tests use the accelerator API.
+        return torch.accelerator.max_memory_allocated
+    return lambda *args, **kwargs: 0
+
+def get_device_name(device_type: str) -> str:
+    """Human-readable accelerator name for MFU tables. CPU/MPS return the device type."""
+    if device_type == "cuda":
+        return torch.cuda.get_device_name(0)
+    if device_type == "tpu":
+        return torch.tpu.get_device_properties().name
+    return device_type
 
 def compute_cleanup():
     """Companion function to compute_init, to clean things up before script exit"""
@@ -230,6 +302,16 @@ def get_peak_flops(device_name: str) -> float:
 
     # Table order matters: more specific patterns first.
     _PEAK_FLOPS_TABLE = (
+        # Google Cloud TPU, dense BF16 per chip
+        (["ironwood"], 4.614e15),
+        (["tpu7"], 4.614e15),
+        (["v7"], 4.614e15),
+        (["trillium"], 918e12),
+        (["v6e"], 918e12),
+        (["v5e"], 197e12),
+        (["v5litepod"], 197e12),
+        (["v5p"], 459e12),
+        (["v4"], 275e12),
         # NVIDIA Blackwell
         (["gb200"], 2.5e15),
         (["grace blackwell"], 2.5e15),
@@ -288,6 +370,16 @@ def get_peak_bandwidth(device_name: str) -> float:
 
     # Table order matters: more specific patterns first.
     _PEAK_BANDWIDTH_TABLE = (
+        # Google Cloud TPU HBM, bytes/sec per chip
+        (["ironwood"], 7.37e12),
+        (["tpu7"], 7.37e12),
+        (["v7"], 7.37e12),
+        (["trillium"], 1.64e12),
+        (["v6e"], 1.64e12),
+        (["v5p"], 2.765e12),
+        (["v5e"], 819e9),
+        (["v5litepod"], 819e9),
+        (["v4"], 1.2e12),
         # NVIDIA Blackwell (HBM3e / GDDR7)
         (["gb200"], 8.0e12),
         (["grace blackwell"], 8.0e12),

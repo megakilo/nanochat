@@ -16,7 +16,7 @@ os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 import time
 import wandb
 import torch
-from nanochat.common import compute_init, compute_cleanup, print0, DummyWandb, get_base_dir, autodetect_device_type, get_peak_flops, COMPUTE_DTYPE, COMPUTE_DTYPE_REASON, is_ddp_initialized
+from nanochat.common import compute_init, compute_cleanup, print0, DummyWandb, get_base_dir, autodetect_device_type, get_peak_flops, get_device_name, compile_model, device_synchronize, device_peak_memory, COMPUTE_DTYPE, COMPUTE_DTYPE_REASON, is_ddp_initialized
 from nanochat.tokenizer import get_token_bytes
 from nanochat.checkpoint_manager import save_checkpoint, load_model, load_optimizer_state
 from nanochat.loss_eval import evaluate_bpb
@@ -36,7 +36,7 @@ parser = argparse.ArgumentParser(description="Supervised fine-tuning (SFT) the m
 # Logging
 parser.add_argument("--run", type=str, default="dummy", help="wandb run name ('dummy' disables wandb logging)")
 # Runtime
-parser.add_argument("--device-type", type=str, default="", help="cuda|cpu|mps (empty = autodetect)")
+parser.add_argument("--device-type", type=str, default="", help="cuda|cpu|mps|tpu (empty = autodetect)")
 parser.add_argument("--attn-impl", type=str, default=None, choices=VALID_IMPLS, help="attention backend (default: $NANOCHAT_ATTN_IMPL or auto)")
 # Model loading
 parser.add_argument("--model-tag", type=str, default=None, help="model tag to load from")
@@ -74,12 +74,13 @@ device_type = autodetect_device_type() if args.device_type == "" else args.devic
 ddp, ddp_rank, ddp_local_rank, ddp_world_size, device = compute_init(device_type)
 master_process = ddp_rank == 0
 print0(f"COMPUTE_DTYPE: {COMPUTE_DTYPE} ({COMPUTE_DTYPE_REASON})")
-synchronize = torch.cuda.synchronize if device_type == "cuda" else lambda: None
-get_max_memory = torch.cuda.max_memory_allocated if device_type == "cuda" else lambda: 0
-if device_type == "cuda":
-    gpu_device_name = torch.cuda.get_device_name(0)
-    gpu_peak_flops = get_peak_flops(gpu_device_name)
-    print0(f"GPU: {gpu_device_name} | Peak FLOPS (BF16): {gpu_peak_flops:.2e}")
+synchronize = device_synchronize(device_type)
+get_max_memory = device_peak_memory(device_type)
+if device_type in ("cuda", "tpu"):
+    accel_name = get_device_name(device_type)
+    gpu_peak_flops = get_peak_flops(accel_name)
+    kind = "GPU" if device_type == "cuda" else "TPU"
+    print0(f"{kind}: {accel_name} | Peak FLOPS (BF16): {gpu_peak_flops:.2e}")
 else:
     gpu_peak_flops = float('inf')  # MFU not meaningful for CPU/MPS
 
@@ -120,7 +121,7 @@ for name, fallback, source in [
         print0(f"Using {name}={arg_val}")
 
 orig_model = model
-model = torch.compile(model, dynamic=False)
+model = compile_model(model, dynamic=False)
 depth = model.config.n_layer
 num_flops_per_token = model.estimate_flops()
 tokens_per_fwdbwd = args.device_batch_size * args.max_seq_len # tokens per iteration for a single rank
@@ -282,10 +283,10 @@ def sft_data_generator_bos_bestfit(split, buffer_size=100):
                 last_step = True
 
         # Build tensors
-        use_cuda = device_type == "cuda"
-        batch_tensor = torch.tensor(rows, dtype=torch.long, pin_memory=use_cuda)
-        inputs = batch_tensor[:, :-1].to(device=device, dtype=torch.int32, non_blocking=use_cuda).contiguous()
-        targets = batch_tensor[:, 1:].to(device=device, dtype=torch.int64, non_blocking=use_cuda).contiguous()
+        use_accel = device_type in ("cuda", "tpu")
+        batch_tensor = torch.tensor(rows, dtype=torch.long, pin_memory=use_accel)
+        inputs = batch_tensor[:, :-1].to(device=device, dtype=torch.int32, non_blocking=use_accel).contiguous()
+        targets = batch_tensor[:, 1:].to(device=device, dtype=torch.int64, non_blocking=use_accel).contiguous()
 
         # Apply the loss mask from render_conversation (mask=1 for assistant completions,
         # mask=0 for user prompts, BOS, special tokens, tool outputs). mask[1:] aligns

@@ -452,10 +452,13 @@ class TestOverrideMechanism:
                 expected = 'sdpa'
         else:
             expected = 'sdpa'
+        if expected == 'sdpa' and fa_module.has_splash():
+            expected = 'splash'
         assert fa_module.ATTN_IMPL == expected
         assert fa_module.USE_FA3 == (expected == 'fa3')
         assert fa_module.USE_FA2 == (expected == 'fa2')
         assert fa_module.USE_FA4 == (expected == 'fa4')
+        assert fa_module.USE_SPLASH == (expected == 'splash')
 
     def test_override_invalid(self):
         """Test that an unknown backend name is rejected."""

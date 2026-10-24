@@ -34,6 +34,7 @@ nanochat uses [uv](https://docs.astral.sh/uv/) for dependency management. To ins
 ```bash
 uv sync --extra gpu    # Use for CUDA (A100/H100/Blackwell/etc.)
 uv sync --extra cpu    # (or) Use for CPU-only / MPS
+uv sync --extra tpu    # (or) Use for Cloud TPU (TorchTPU + TPU Splash Attention)
 source .venv/bin/activate
 ```
 
@@ -111,6 +112,30 @@ The important thing to note is that nanochat is written and configured around on
 
 The script [runs/runcpu.sh](runs/runcpu.sh) shows a very simple example of running on CPU or Apple Silicon. It dramatically shrinks the LLM that is being trained to make things fit into a reasonable time interval of a few ten minutes of training. You will not get strong results in this way.
 
+## Running on TPU
+
+TorchTPU is the device backend (`device_type="tpu"`, `torch.compile(..., backend="tpu")`, distributed backend `tpu_dist`). Attention uses Google's TPU Splash Attention, the JAX Pallas kernel `jax.experimental.pallas.ops.tpu.splash_attention`: softmax attention with static causal and local masks. Install on a TPU VM with:
+
+```bash
+uv sync --extra tpu
+source .venv/bin/activate
+```
+
+Single-chip:
+
+```bash
+python -m scripts.base_train --device-type=tpu --depth=6 --max-seq-len=512 --device-batch-size=8 --total-batch-size=16384 --num-iterations=20
+```
+
+One host, one process per chip (the `eval` line fills in the TPU topology env vars TorchTPU needs):
+
+```bash
+eval $(python -m torch.tpu.distributed | sed 's/^/export /')
+torchrun --nproc_per_node=8 -m scripts.base_train -- --device-type=tpu
+```
+
+`--device-type` autodetects a TPU when TorchTPU is installed and CUDA is not. Splash Attention tiles sequence lengths in multiples of 128 (the default 2048 and 512 both qualify). Shorter shapes, including token-by-token decode, use PyTorch SDPA.
+
 ## Precision / dtype
 
 nanochat does not use `torch.amp.autocast`. Instead, precision is managed explicitly through a single global `COMPUTE_DTYPE` (defined in `nanochat/common.py`). By default this is auto-detected based on your hardware:
@@ -119,6 +144,7 @@ nanochat does not use `torch.amp.autocast`. Instead, precision is managed explic
 |----------|--------------|-----|
 | CUDA SM 80+ (A100, H100, ...) | `bfloat16` | Native bf16 tensor cores |
 | CUDA SM < 80 (V100, T4, ...) | `float32` | No bf16; fp16 available via `NANOCHAT_DTYPE=float16` (uses GradScaler) |
+| TPU | `bfloat16` | MXU compute is bf16. Override with `NANOCHAT_DTYPE=float32` |
 | CPU / MPS | `float32` | Safe default. On recent macOS, MPS also runs `NANOCHAT_DTYPE=bfloat16` fine (~25% less memory, similar speed) |
 
 You can override the default with the `NANOCHAT_DTYPE` environment variable:
@@ -162,6 +188,7 @@ I've published a number of guides that might contain helpful information, most r
 │   ├── gpt.py                      # The GPT nn.Module Transformer
 │   ├── loss_eval.py                # Evaluate bits per byte (instead of loss)
 │   ├── optim.py                    # AdamW + Muon optimizer, 1GPU and distributed
+│   ├── splash_attention.py         # Google TPU Splash Attention (Pallas softmax kernel)
 │   └── tokenizer.py                # BPE Tokenizer wrapper in style of GPT-4
 ├── pyproject.toml
 ├── runs

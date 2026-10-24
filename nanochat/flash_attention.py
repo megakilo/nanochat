@@ -1,15 +1,17 @@
 """
-Unified Flash Attention interface with automatic FA3/FA4/FA2/SDPA switching.
+Unified attention interface with automatic FA3/FA4/FA2/Splash/SDPA switching.
 
 Exports `flash_attn` module that matches the FA3 API exactly, but can route to
 Flash Attention 4 (`kernels-community/flash-attn4`, CuTe DSL), Flash Attention 2
-(`kernels-community/flash-attn2`), or fall back to PyTorch SDPA on incompatible
+(`kernels-community/flash-attn2`), Google's TPU Splash Attention (JAX Pallas
+softmax kernel, not AdaSplash), or fall back to PyTorch SDPA on incompatible
 CUDA GPUs, MPS, and CPU.
 
 Backend selection (in order of precedence):
-    1. set_attn_impl('fa4' | 'fa3' | 'fa2' | 'sdpa' | 'auto')  (e.g. via --attn-impl CLI flag)
+    1. set_attn_impl('fa4' | 'fa3' | 'fa2' | 'splash' | 'sdpa' | 'auto')
     2. NANOCHAT_ATTN_IMPL environment variable                  (same values)
-    3. 'auto': FA3 (sm80/sm90), else FA4 (sm100/sm110), else FA2, else FA4, else SDPA
+    3. 'auto': FA3 (sm80/sm90), else FA4 (sm100/sm110), else FA2, else FA4,
+       else Splash on TPU, else SDPA
 
 Usage (drop-in replacement for FA3):
     from nanochat.flash_attention import flash_attn
@@ -27,7 +29,7 @@ os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
 import torch
 import torch.nn.functional as F
 
-VALID_IMPLS = ("auto", "fa4", "fa3", "fa2", "sdpa")
+VALID_IMPLS = ("auto", "fa4", "fa3", "fa2", "splash", "sdpa")
 
 
 # =============================================================================
@@ -136,6 +138,30 @@ def has_fa4():
 
 
 # =============================================================================
+# Detection: Splash Attention on TPU (lazy, cached)
+# =============================================================================
+_splash_ok = False
+_splash_load_error = None
+_splash_checked = False
+
+
+def _load_splash():
+    """Whether Splash Attention can run on this TPU. Cached."""
+    global _splash_ok, _splash_load_error, _splash_checked
+    if _splash_checked:
+        return _splash_ok
+    _splash_checked = True
+    from nanochat.splash_attention import splash_available
+    _splash_ok, _splash_load_error = splash_available()
+    return _splash_ok
+
+
+def has_splash():
+    """Whether TorchTPU Splash Attention is importable on this machine."""
+    return _load_splash()
+
+
+# =============================================================================
 # Backend resolution
 # =============================================================================
 # Override (e.g. for testing or CLI): 'fa4', 'fa3', 'fa2', 'sdpa', or None (auto / env var)
@@ -171,6 +197,11 @@ def _resolve_attn_impl():
         assert COMPUTE_DTYPE in (torch.bfloat16, torch.float16), \
             f"FA4 only supports bf16/fp16, but COMPUTE_DTYPE={COMPUTE_DTYPE}"
         return "fa4"
+    if requested == "splash":
+        assert has_splash(), f"Cannot use Splash Attention: {_splash_load_error}"
+        assert COMPUTE_DTYPE in (torch.bfloat16, torch.float32, torch.float16), \
+            f"Splash Attention supports bf16/fp32/fp16, but COMPUTE_DTYPE={COMPUTE_DTYPE}"
+        return "splash"
     # auto
     # FA3 Hopper kernels only support bf16 and fp8; fp16/fp32 must use another backend
     if HAS_FA3 and COMPUTE_DTYPE == torch.bfloat16:
@@ -185,44 +216,45 @@ def _resolve_attn_impl():
             return "fa2"
         if has_fa4():
             return "fa4"
+    if has_splash():
+        return "splash"
     return "sdpa"
+
+
+def _apply_impl(impl):
+    global ATTN_IMPL, USE_FA3, USE_FA4, USE_FA2, USE_SPLASH
+    ATTN_IMPL = impl
+    USE_FA3 = impl == "fa3"
+    USE_FA4 = impl == "fa4"
+    USE_FA2 = impl == "fa2"
+    USE_SPLASH = impl == "splash"
 
 
 def _resolve_use_fa3():
     """Backwards-compatible helper: whether the resolved backend is FA3."""
-    global ATTN_IMPL, USE_FA3, USE_FA4, USE_FA2
-    ATTN_IMPL = _resolve_attn_impl()
-    USE_FA3 = ATTN_IMPL == "fa3"
-    USE_FA4 = ATTN_IMPL == "fa4"
-    USE_FA2 = ATTN_IMPL == "fa2"
+    _apply_impl(_resolve_attn_impl())
     return USE_FA3
 
 
 try:
-    ATTN_IMPL = _resolve_attn_impl()
+    _apply_impl(_resolve_attn_impl())
 except AssertionError:
     # Defer hard failure on invalid/unavailable NANOCHAT_ATTN_IMPL until set_attn_impl()
     # so CLI --attn-impl can take precedence over the environment variable.
-    ATTN_IMPL = "sdpa"
-USE_FA3 = ATTN_IMPL == "fa3"
-USE_FA4 = ATTN_IMPL == "fa4"
-USE_FA2 = ATTN_IMPL == "fa2"
+    _apply_impl("sdpa")
 
 
 def set_attn_impl(impl):
     """
-    Select the attention backend at runtime: 'fa4', 'fa3', 'fa2', 'sdpa', or 'auto'/None.
+    Select the attention backend at runtime: 'fa4', 'fa3', 'fa2', 'splash', 'sdpa', or 'auto'/None.
     Must be called before the model is torch.compile'd / run. Returns the resolved backend.
     """
-    global _override_impl, ATTN_IMPL, USE_FA3, USE_FA4, USE_FA2
+    global _override_impl
     if impl is not None:
         impl = impl.strip().lower()
         assert impl in VALID_IMPLS, f"Invalid attention impl {impl!r}, expected one of {VALID_IMPLS}"
     _override_impl = None if impl in (None, "auto") else impl
-    ATTN_IMPL = _resolve_attn_impl()
-    USE_FA3 = ATTN_IMPL == "fa3"
-    USE_FA4 = ATTN_IMPL == "fa4"
-    USE_FA2 = ATTN_IMPL == "fa2"
+    _apply_impl(_resolve_attn_impl())
     return ATTN_IMPL
 
 
@@ -230,6 +262,7 @@ ATTN_IMPL_NAMES = {
     "fa3": "Flash Attention 3",
     "fa4": "Flash Attention 4",
     "fa2": "Flash Attention 2",
+    "splash": "TPU Splash Attention",
     "sdpa": "PyTorch SDPA",
 }
 
@@ -315,7 +348,7 @@ def _fa4_attention(q, k, v, causal, window_size):
 # =============================================================================
 # SDPA helpers
 # =============================================================================
-def _sdpa_attention(q, k, v, window_size, enable_gqa):
+def _sdpa_attention(q, k, v, window_size, enable_gqa, causal=True):
     """
     SDPA attention with sliding window support.
     q, k, v are (B, H, T, D) format.
@@ -323,6 +356,22 @@ def _sdpa_attention(q, k, v, window_size, enable_gqa):
     Tq = q.size(2)
     Tk = k.size(2)
     window = window_size[0]
+
+    if not causal:
+        left, right = window_size
+        left_unlimited = left is None or left < 0 or left >= Tk - 1
+        right_unlimited = right is None or right < 0 or right >= Tk - 1
+        if left_unlimited and right_unlimited:
+            return F.scaled_dot_product_attention(q, k, v, is_causal=False, enable_gqa=enable_gqa)
+        device = q.device
+        row_idx = (Tk - Tq) + torch.arange(Tq, device=device).unsqueeze(1)
+        col_idx = torch.arange(Tk, device=device).unsqueeze(0)
+        mask = torch.ones((Tq, Tk), dtype=torch.bool, device=device)
+        if not left_unlimited:
+            mask = mask & ((row_idx - col_idx) <= left)
+        if not right_unlimited:
+            mask = mask & ((col_idx - row_idx) <= right)
+        return F.scaled_dot_product_attention(q, k, v, attn_mask=mask, enable_gqa=enable_gqa)
 
     # Full context, same length
     if (window < 0 or window >= Tq) and Tq == Tk:
@@ -350,6 +399,59 @@ def _sdpa_attention(q, k, v, window_size, enable_gqa):
 
     return F.scaled_dot_product_attention(q, k, v, attn_mask=mask, enable_gqa=enable_gqa)
 
+
+def _sdpa_bthd(q, k, v, window_size, causal=True):
+    """SDPA on FA layout ``(B, T, H, D)``. Returns the same layout."""
+    q = q.transpose(1, 2)
+    k = k.transpose(1, 2)
+    v = v.transpose(1, 2)
+    enable_gqa = q.size(1) != k.size(1)
+    y = _sdpa_attention(q, k, v, window_size, enable_gqa, causal=causal)
+    return y.transpose(1, 2)
+
+
+_splash_fallback_warned = False
+
+
+def _splash_bthd(q, k, v, causal, window_size, warn_on_fallback=True):
+    """Splash Attention on FA layout ``(B, T, H, D)``.
+
+    Shapes the kernel cannot tile (not a multiple of 128, including decode
+    steps of length 1) fall back to SDPA. That path is exact; it is just
+    slower, and it is what inference uses between prefill chunks.
+    """
+    global _splash_fallback_warned
+    from nanochat.splash_attention import splash_local_window, splash_sdpa, splash_shapes_ok
+    q_len, kv_len, head_dim = q.size(1), k.size(1), q.size(3)
+    shapes_ok = splash_shapes_ok(q_len, kv_len, head_dim) and (q.size(2) % k.size(2) == 0)
+    if not causal:
+        left, right = window_size
+        window_limited = (left is not None and left >= 0) or (right is not None and right >= 0)
+        if window_limited or not shapes_ok:
+            return _sdpa_bthd(q, k, v, window_size, causal=False)
+        local_window = None
+    elif not shapes_ok:
+        if warn_on_fallback and not _splash_fallback_warned:
+            _splash_fallback_warned = True
+            from nanochat.common import print0
+            print0(
+                f"Splash Attention needs sequence lengths and head_dim that are multiples of 128 "
+                f"(got q={q_len}, kv={kv_len}, head_dim={head_dim}); using PyTorch SDPA for this shape."
+            )
+        return _sdpa_bthd(q, k, v, window_size, causal=True)
+    else:
+        local_window = splash_local_window(window_size, kv_len)
+    y = splash_sdpa(
+        q.transpose(1, 2).contiguous(),
+        k.transpose(1, 2).contiguous(),
+        v.transpose(1, 2).contiguous(),
+        is_causal=causal,
+        local_window_size=local_window,
+        enable_gqa=q.size(2) != k.size(2),
+    )
+    return y.transpose(1, 2)
+
+
 # =============================================================================
 # Public API: Same interface as FA3
 # =============================================================================
@@ -371,14 +473,10 @@ def flash_attn_func(q, k, v, causal=False, window_size=(-1, -1)):
         return _fa2.flash_attn_func(q, k, v, causal=causal, window_size=window_size)
     if ATTN_IMPL == "fa4":
         return _fa4_attention(q, k, v, causal, window_size)
+    if ATTN_IMPL == "splash":
+        return _splash_bthd(q, k, v, causal, window_size)
 
-    # SDPA fallback: transpose (B, T, H, D) -> (B, H, T, D)
-    q = q.transpose(1, 2)
-    k = k.transpose(1, 2)
-    v = v.transpose(1, 2)
-    enable_gqa = q.size(1) != k.size(1)
-    y = _sdpa_attention(q, k, v, window_size, enable_gqa)
-    return y.transpose(1, 2)  # back to (B, T, H, D)
+    return _sdpa_bthd(q, k, v, window_size, causal=causal)
 
 
 def flash_attn_with_kvcache(q, k_cache, v_cache, k=None, v=None, cache_seqlens=None,
@@ -410,8 +508,8 @@ def flash_attn_with_kvcache(q, k_cache, v_cache, k=None, v=None, cache_seqlens=N
             causal=causal, window_size=window_size
         )
 
-    # FA4 / SDPA: manually manage KV cache
-    B, T_new, H, D = q.shape
+    # FA4 / Splash / SDPA: manually manage KV cache
+    T_new = q.size(1)
     pos = cache_seqlens[0].item()  # assume uniform position across batch
 
     # Insert new k, v into cache (in-place, matching FA3 behavior)
@@ -427,16 +525,12 @@ def flash_attn_with_kvcache(q, k_cache, v_cache, k=None, v=None, cache_seqlens=N
     if ATTN_IMPL == "fa4":
         # FA4 has no kvcache API; causal masking is bottom-right aligned when Tq != Tk, matching FA3
         return _fa4_attention(q, k_full, v_full, causal, window_size)
+    if ATTN_IMPL == "splash":
+        # Splash has no KV-cache API. Prefill lengths that tile by 128 run the
+        # kernel; decode steps fall back to SDPA inside _splash_bthd without warning.
+        return _splash_bthd(q, k_full, v_full, causal, window_size, warn_on_fallback=False)
 
-    # Transpose to SDPA layout: (B, T, H, D) -> (B, H, T, D)
-    q_sdpa = q.transpose(1, 2)
-    k_sdpa = k_full.transpose(1, 2)
-    v_sdpa = v_full.transpose(1, 2)
-
-    enable_gqa = q_sdpa.size(1) != k_sdpa.size(1)
-    y_sdpa = _sdpa_attention(q_sdpa, k_sdpa, v_sdpa, window_size, enable_gqa)
-
-    return y_sdpa.transpose(1, 2)  # back to (B, T, H, D)
+    return _sdpa_bthd(q, k_full, v_full, window_size, causal=causal)
 
 
 # =============================================================================
