@@ -18,6 +18,7 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 
 from nanochat.common import get_dist_info, print0, COMPUTE_DTYPE
 from nanochat.optim import MuonAdamW
@@ -81,8 +82,8 @@ class CausalSelfAttention(nn.Module):
         self.ve_gate_channels = 12
         self.ve_gate = Linear(self.ve_gate_channels, self.n_kv_head, bias=False) if has_ve(layer_idx, config.n_layer) else None
 
-    def forward(self, x, ve, cos_sin, window_size, kv_cache):
-        B, T, C = x.size()
+    def project_qkv(self, x, ve, cos_sin):
+        B, T, _ = x.size()
 
         # Project the input to get queries, keys, and values
         # Shape: (B, T, H, D) - FA3's native layout, no transpose needed!
@@ -102,6 +103,11 @@ class CausalSelfAttention(nn.Module):
         q, k = norm(q), norm(k) # QK norm
         q = q * 1.2  # sharper attention (split scale between Q and K), TODO think through better
         k = k * 1.2
+        return q, k, v
+
+    def forward(self, x, ve, cos_sin, window_size, kv_cache):
+        B, T, _ = x.size()
+        q, k, v = self.project_qkv(x, ve, cos_sin)
 
         # Flash Attention (FA3 or SDPA fallback)
         # window_size is (left, right) tuple: (N, 0) for causal, (-1, 0) for full context
@@ -152,6 +158,31 @@ class Block(nn.Module):
         x = x + self.mlp(norm(x))
         return x
 
+    def forward_checkpointed(self, x, x0, resid_lambda, x0_lambda, idx, ve_embed, cos_sin, window_size):
+        """Split-attention activation checkpointing for training.
+        Checkpoints QKV preparation and post-attention + MLP around the attention
+        kernel so attention itself is never recomputed in the backward pass, while
+        large MLP/norm/RoPE/value-embed intermediates are recomputed on the fly."""
+        B, T, _ = x.size()
+        attn = self.attn
+        mlp = self.mlp
+
+        def _prep_qkv(x_in, x0_in, resid_l, x0_l, idx_in):
+            x_s = resid_l * x_in + x0_l * x0_in
+            x_n = norm(x_s)
+            ve = ve_embed(idx_in).to(x_n.dtype) if ve_embed is not None else None
+            return attn.project_qkv(x_n, ve, cos_sin)
+
+        q, k, v = checkpoint(_prep_qkv, x, x0, resid_lambda, x0_lambda, idx, use_reentrant=False)
+        y_attn = flash_attn.flash_attn_func(q, k, v, causal=True, window_size=window_size)
+
+        def _post_attn_mlp(x_in, x0_in, resid_l, x0_l, y_in):
+            x_s = resid_l * x_in + x0_l * x0_in
+            x_mid = x_s + attn.c_proj(y_in.contiguous().view(B, T, -1))
+            return x_mid + mlp(norm(x_mid))
+
+        return checkpoint(_post_attn_mlp, x, x0, resid_lambda, x0_lambda, y_attn, use_reentrant=False)
+
 
 class GPT(nn.Module):
     def __init__(self, config, pad_vocab_size_to=64):
@@ -162,6 +193,7 @@ class GPT(nn.Module):
         """
         super().__init__()
         self.config = config
+        self.grad_checkpoint = False
         # Compute per-layer window sizes for sliding window attention
         # window_size is (left, right) tuple: (-1, 0) for full context, (N, 0) for sliding window
         self.window_sizes = self._compute_window_sizes(config)
@@ -457,7 +489,13 @@ class GPT(nn.Module):
             group["initial_lr"] = group["lr"]
         return optimizer
 
-    def forward(self, idx, targets=None, kv_cache=None, loss_reduction='mean'):
+    def _loss_chunk(self, x_chunk, target_chunk, softcap, reduction):
+        logits = self.lm_head(x_chunk)[..., :self.config.vocab_size]
+        logits = logits.float()
+        logits = softcap * torch.tanh(logits / softcap)
+        return F.cross_entropy(logits, target_chunk, ignore_index=-1, reduction=reduction)
+
+    def forward(self, idx, targets=None, kv_cache=None, loss_reduction='mean', loss_scale=None):
         B, T = idx.size()
 
         # Grab the rotary embeddings for the current sequence length (they are of shape (1, seq_len, 1, head_dim/2))
@@ -497,10 +535,18 @@ class GPT(nn.Module):
         n_layer = self.config.n_layer
         backout_layer = n_layer // 2  # cache at halfway point
         x_backout = None
+        use_ckpt = self.grad_checkpoint and self.training and kv_cache is None and torch.is_grad_enabled()
         for i, block in enumerate(self.transformer.h):
-            x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
-            ve = self.value_embeds[str(i)](idx).to(x.dtype) if str(i) in self.value_embeds else None
-            x = block(x, ve, cos_sin, self.window_sizes[i], kv_cache)
+            ve_embed = self.value_embeds[str(i)] if str(i) in self.value_embeds else None
+            if use_ckpt:
+                x = block.forward_checkpointed(
+                    x, x0, self.resid_lambdas[i], self.x0_lambdas[i],
+                    idx, ve_embed, cos_sin, self.window_sizes[i],
+                )
+            else:
+                x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
+                ve = ve_embed(idx).to(x.dtype) if ve_embed is not None else None
+                x = block(x, ve, cos_sin, self.window_sizes[i], kv_cache)
             if i == backout_layer:
                 x_backout = x
         # Subtract mid-layer residual to remove low-level features before logit projection
@@ -510,18 +556,43 @@ class GPT(nn.Module):
 
         # Forward the lm_head (compute logits)
         softcap = 15 # smoothly cap the logits to the range [-softcap, softcap]
-        logits = self.lm_head(x) # (B, T, padded_vocab_size) <- very big tensor, large amount of memory
-        logits = logits[..., :self.config.vocab_size] # slice to remove padding
-        logits = logits.float() # switch to fp32 for logit softcap and loss computation
-        logits = softcap * torch.tanh(logits / softcap) # squash the logits
-
         if targets is not None:
-            # training: given the targets, compute and return the loss
-            # TODO experiment with chunked cross-entropy?
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1, reduction=loss_reduction)
+            # training / eval loss: chunk along tokens so full (B, T, vocab_size) fp32
+            # logits + softcap tensors are never materialized all at once in HBM/VRAM
+            x_flat = x.view(-1, x.size(-1))
+            t_flat = targets.view(-1)
+            num_chunks = min(8, max(1, x_flat.size(0) // 1024))
+            grad_enabled = torch.is_grad_enabled()
+            if loss_reduction == 'none':
+                if num_chunks > 1:
+                    chunk_losses = [
+                        checkpoint(self._loss_chunk, x_c, t_c, softcap, 'none', use_reentrant=False)
+                        if grad_enabled else self._loss_chunk(x_c, t_c, softcap, 'none')
+                        for x_c, t_c in zip(x_flat.chunk(num_chunks), t_flat.chunk(num_chunks))
+                    ]
+                    loss = torch.cat(chunk_losses, dim=0)
+                else:
+                    loss = self._loss_chunk(x_flat, t_flat, softcap, 'none')
+            elif num_chunks > 1 or (use_ckpt and grad_enabled):
+                chunk_losses = [
+                    checkpoint(self._loss_chunk, x_c, t_c, softcap, 'sum', use_reentrant=False)
+                    if grad_enabled else self._loss_chunk(x_c, t_c, softcap, 'sum')
+                    for x_c, t_c in zip(x_flat.chunk(num_chunks), t_flat.chunk(num_chunks))
+                ]
+                loss = torch.stack(chunk_losses).sum()
+                if loss_reduction == 'mean':
+                    loss = loss / (t_flat != -1).sum().clamp(min=1)
+            else:
+                loss = self._loss_chunk(x_flat, t_flat, softcap, loss_reduction)
+            if loss_scale is not None:
+                loss = loss * loss_scale
             return loss
         else:
             # inference: just return the logits directly
+            logits = self.lm_head(x) # (B, T, padded_vocab_size)
+            logits = logits[..., :self.config.vocab_size] # slice to remove padding
+            logits = logits.float() # switch to fp32 for logit softcap
+            logits = softcap * torch.tanh(logits / softcap) # squash the logits
             return logits
 
     @torch.inference_mode()

@@ -168,3 +168,99 @@ def test_splash_mixed_windows_compile_single_graph(monkeypatch):
     assert explanation.graph_count == 1
     assert explanation.graph_break_count == 0
 
+
+def test_gpt_grad_checkpoint_and_chunked_loss_no_attn_recompute(monkeypatch):
+    import copy
+    import types
+    import nanochat.splash_attention as sa
+    from nanochat.gpt import GPT, GPTConfig
+
+    fwd_calls = []
+    bwd_calls = []
+
+    def fake_make_splash(**kwargs):
+        assert kwargs.get("use_vmap_bwd") is True
+
+        def fwd(q, k, v):
+            fwd_calls.append(1)
+            return (q + k + v) / 3.0, torch.zeros(q.shape[:-1], dtype=torch.float32, device=q.device)
+
+        def bwd(q, k, v, out, lse, g):
+            assert g.is_contiguous()
+            bwd_calls.append(1)
+            g3 = g / 3.0
+            return g3.clone(), g3.clone(), g3.clone()
+
+        return fwd, bwd
+
+    def fake_jax_op(qualname, fn):
+        if "_fwd_" in qualname:
+            @torch.library.custom_op(qualname, mutates_args=())
+            def op(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+                return fn(q, k, v)
+
+            @op.register_fake
+            def _(q, k, v):
+                return q.new_empty(q.shape), q.new_empty(q.shape[:-1], dtype=torch.float32)
+
+            return op
+
+        @torch.library.custom_op(qualname, mutates_args=())
+        def bwd_op(
+            q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
+            out: torch.Tensor, lse: torch.Tensor, g: torch.Tensor,
+        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+            return fn(q, k, v, out, lse, g)
+
+        @bwd_op.register_fake
+        def _(q, k, v, out, lse, g):
+            return q.new_empty(q.shape), k.new_empty(k.shape), v.new_empty(v.shape)
+
+        return bwd_op
+
+    monkeypatch.setattr(sa, "_make_splash_attention_fn", fake_make_splash)
+    monkeypatch.setattr(sa, "_splash_fwd_ops", {})
+    monkeypatch.setattr(sa, "_splash_ops", types.SimpleNamespace())
+    monkeypatch.setattr(
+        torch, "tpu", types.SimpleNamespace(pallas=types.SimpleNamespace(jax_op=fake_jax_op)), raising=False
+    )
+    monkeypatch.setattr(fa_module, "ATTN_IMPL", "splash")
+
+    cfg = GPTConfig(
+        sequence_len=512, vocab_size=256, n_layer=2, n_head=2, n_kv_head=2, n_embd=256, window_pattern="SL"
+    )
+    torch.manual_seed(0)
+    m_ref = GPT(cfg)
+    m_ref.init_weights()
+    m_ckpt = copy.deepcopy(m_ref)
+    m_ckpt.grad_checkpoint = True
+
+    idx = torch.randint(0, 256, (4, 512))
+    targets = torch.randint(0, 256, (4, 512))
+
+    # Reference forward + backward (scaled outside)
+    loss_ref = m_ref(idx, targets) * 0.25
+    loss_ref.backward()
+
+    # Checkpointed forward + backward under aot_eager compile with fused loss_scale
+    fwd_calls.clear()
+    bwd_calls.clear()
+    explanation = torch._dynamo.explain(m_ckpt)(idx, targets, loss_scale=0.25)
+    assert explanation.graph_count == 1
+    assert explanation.graph_break_count == 0
+
+    fwd_calls.clear()
+    bwd_calls.clear()
+    compiled_ckpt = torch.compile(m_ckpt, backend="aot_eager", dynamic=False)
+    loss_ckpt = compiled_ckpt(idx, targets, loss_scale=0.25)
+    loss_ckpt.backward()
+
+    # Splash Attention forward must run once per layer (never recomputed during backward)
+    assert len(fwd_calls) == cfg.n_layer
+    assert len(bwd_calls) == cfg.n_layer
+    torch.testing.assert_close(loss_ref, loss_ckpt, rtol=1e-5, atol=1e-5)
+    for (n1, p1), (n2, p2) in zip(m_ref.named_parameters(), m_ckpt.named_parameters()):
+        assert n1 == n2
+        torch.testing.assert_close(p1.grad, p2.grad, rtol=1e-4, atol=1e-4)
+
+

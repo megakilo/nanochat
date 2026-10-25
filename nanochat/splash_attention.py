@@ -126,7 +126,7 @@ def _make_splash_attention_fn(
     q_layout: str = "HEAD_DIM_MINOR",
     k_layout: str = "HEAD_DIM_MINOR",
     v_layout: str = "HEAD_DIM_MINOR",
-    use_vmap_bwd: bool = False,
+    use_vmap_bwd: bool = True,
 ):
     """Build JAX Splash forward and backward callables for one static shape.
 
@@ -325,7 +325,7 @@ def _get_splash_op(**splash_kwargs) -> str:
     def backward(ctx, grad_out, grad_lse):
         del grad_lse
         q, k, v, out, lse = ctx.saved_tensors
-        return torch_bwd_fn(q, k, v, out, lse, grad_out)
+        return torch_bwd_fn(q, k, v, out, lse, grad_out.contiguous())
 
     torch_fwd_fn.register_autograd(backward, setup_context=setup_context)
     _splash_fwd_ops[cache_key] = torch_fwd_fn
@@ -352,7 +352,7 @@ def splash_sdpa(
     block_q_dq: int | None = None,
     block_kv_dq: int | None = None,
     use_fused_bwd_kernel: bool = True,
-    use_vmap_bwd: bool = False,
+    use_vmap_bwd: bool = True,
     q_layout: str = "HEAD_DIM_MINOR",
     k_layout: str = "HEAD_DIM_MINOR",
     v_layout: str = "HEAD_DIM_MINOR",
@@ -371,6 +371,9 @@ def splash_sdpa(
     if block_dkv is not None:
         block_q_dkv = block_dkv
         block_kv_dkv = block_dkv
+    vmap_env = os.environ.get("SPLASH_VMAP_BWD")
+    if vmap_env is not None:
+        use_vmap_bwd = vmap_env.strip().lower() not in ("0", "false", "no")
 
     _batch, n_heads, q_seq_len, head_dim = q.shape
     n_kv_heads = k.shape[1]

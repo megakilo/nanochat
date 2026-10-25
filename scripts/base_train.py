@@ -60,6 +60,7 @@ parser.add_argument("--target-param-data-ratio", type=float, default=12, help="c
 # Optimization
 parser.add_argument("--device-batch-size", type=int, default=32, help="per-device batch size. good number to reduce to 16,8,4,... if you OOM on VRAM.")
 parser.add_argument("--total-batch-size", type=int, default=-1, help="total batch size in tokens. decent numbers are e.g. 524288. (-1 = auto-compute optimal)")
+parser.add_argument("--grad-checkpoint", action=argparse.BooleanOptionalAction, default=None, help="enable activation checkpointing (default: auto, enabled on TPU)")
 parser.add_argument("--embedding-lr", type=float, default=0.3, help="learning rate for embedding parameters (Adam)")
 parser.add_argument("--unembedding-lr", type=float, default=0.008, help="learning rate for unembedding parameters (Adam)")
 parser.add_argument("--weight-decay", type=float, default=0.28, help="cautious weight decay for the Muon optimizer (for weights)")
@@ -100,6 +101,8 @@ print0(f"COMPUTE_DTYPE: {COMPUTE_DTYPE} ({COMPUTE_DTYPE_REASON})")
 # Flash Attention status
 attn_impl = set_attn_impl(args.attn_impl)  # None => $NANOCHAT_ATTN_IMPL or auto
 user_config["attn_impl"] = attn_impl
+grad_checkpoint = (device_type == "tpu") if args.grad_checkpoint is None else args.grad_checkpoint
+user_config["grad_checkpoint"] = grad_checkpoint
 
 # wandb logging init
 use_dummy_wandb = args.run == "dummy" or not master_process
@@ -251,6 +254,9 @@ def disable_fp8(model):
 # -----------------------------------------------------------------------------
 # Compile the model
 
+model.grad_checkpoint = grad_checkpoint
+if grad_checkpoint:
+    print0("✓ Activation checkpointing enabled (split-attention)")
 orig_model = model # original, uncompiled model, for saving raw model state_dict and for inference/evaluation (because the shapes may change shape)
 model = compile_model(model, dynamic=False) # the inputs to model will never change shape so dynamic=False is safe
 
@@ -516,10 +522,11 @@ while True:
     # evaluate the gradient
     synchronize()
     t0 = time.time()
+    loss_scale = 1.0 / grad_accum_steps
     for micro_step in range(grad_accum_steps):
-        loss = model(x, y)
-        train_loss = loss.detach() # for logging
-        loss = loss / grad_accum_steps # each .backward() is a grad sum => normalize loss here
+        loss = model(x, y, loss_scale=loss_scale)
+        if micro_step == grad_accum_steps - 1:
+            train_loss = loss.detach() # for logging
         if scaler is not None:
             scaler.scale(loss).backward()
         else:
@@ -547,7 +554,7 @@ while True:
     else:
         optimizer.step()
     model.zero_grad(set_to_none=True)
-    train_loss_f = train_loss.item() # .item() is a CPU-GPU sync point
+    train_loss_f = train_loss.item() * grad_accum_steps # .item() is a CPU-GPU sync point
     synchronize()
     t1 = time.time()
     dt = t1 - t0

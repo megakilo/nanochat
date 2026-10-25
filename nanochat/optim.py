@@ -334,9 +334,9 @@ class MuonAdamW(torch.optim.Optimizer):
         """Launch async reduce op for Muon group. Returns info dict."""
         params = group['params']
         if world_size == 1:
-            # Single rank: this rank owns all params, the stacked grads are the "chunk"
-            grad_chunk = torch.stack([p.grad for p in params])
-            return dict(future=None, grad_chunk=grad_chunk, stacked_grads=None, chunk_size=len(params))
+            # Single rank: defer stacking to _compute_muon so only one group's
+            # stacked grads/params are materialized in memory at a time.
+            return dict(future=None, grad_chunk=None, stacked_grads=None, chunk_size=len(params))
         chunk_size = (len(params) + world_size - 1) // world_size
         padded_num_params = chunk_size * world_size
         p = params[0]
@@ -358,6 +358,30 @@ class MuonAdamW(torch.optim.Optimizer):
     def _compute_adamw(self, group: dict, info: dict, gather_list: list, rank: int, world_size: int) -> None:
         """Wait for reduce, compute AdamW updates, launch gathers for large params."""
         param_infos = info['param_infos']
+        if not group['params']:
+            return
+        # Fill group-level 0-D tensors once per group (transferred once on TPU)
+        self._adamw_lr_t.fill_(group['lr'])
+        self._adamw_beta1_t.fill_(group['betas'][0])
+        self._adamw_beta2_t.fill_(group['betas'][1])
+        self._adamw_eps_t.fill_(group['eps'])
+        self._adamw_wd_t.fill_(group['weight_decay'])
+        first_dev = group['params'][0].device
+        if first_dev.type == "tpu":
+            lr_t = self._adamw_lr_t.to(first_dev)
+            beta1_t = self._adamw_beta1_t.to(first_dev)
+            beta2_t = self._adamw_beta2_t.to(first_dev)
+            eps_t = self._adamw_eps_t.to(first_dev)
+            wd_t = self._adamw_wd_t.to(first_dev)
+        else:
+            lr_t = self._adamw_lr_t
+            beta1_t = self._adamw_beta1_t
+            beta2_t = self._adamw_beta2_t
+            eps_t = self._adamw_eps_t
+            wd_t = self._adamw_wd_t
+        cached_step = None
+        step_t = self._adamw_step_t
+
         for p in group['params']:
             pinfo = param_infos[p]
             if pinfo['future'] is not None:
@@ -379,17 +403,14 @@ class MuonAdamW(torch.optim.Optimizer):
                 state['exp_avg_sq'] = torch.zeros_like(p_slice)
             state['step'] += 1
 
-            # Fill 0-D tensors and run fused kernel
-            self._adamw_step_t.fill_(state['step'])
-            self._adamw_lr_t.fill_(group['lr'])
-            self._adamw_beta1_t.fill_(group['betas'][0])
-            self._adamw_beta2_t.fill_(group['betas'][1])
-            self._adamw_eps_t.fill_(group['eps'])
-            self._adamw_wd_t.fill_(group['weight_decay'])
+            # Fill step tensor (reuse device copy when all params in group share step count)
+            if state['step'] != cached_step:
+                cached_step = state['step']
+                self._adamw_step_t.fill_(cached_step)
+                step_t = self._adamw_step_t.to(first_dev) if first_dev.type == "tpu" else self._adamw_step_t
             adamw_step_fused(
                 p_slice, grad_slice, state['exp_avg'], state['exp_avg_sq'],
-                self._adamw_step_t, self._adamw_lr_t, self._adamw_beta1_t,
-                self._adamw_beta2_t, self._adamw_eps_t, self._adamw_wd_t,
+                step_t, lr_t, beta1_t, beta2_t, eps_t, wd_t,
             )
 
             # Large params need all_gather
@@ -424,6 +445,7 @@ class MuonAdamW(torch.optim.Optimizer):
         if num_owned > 0:
             owned_params = [params[start_idx + i] for i in range(num_owned)]
             stacked_owned = torch.stack(owned_params)
+            owned_grads = torch.stack([ param.grad for param in owned_params ]) if grad_chunk is None else grad_chunk[:num_owned]
 
             # Fill 0-D tensors and run fused kernel
             self._muon_momentum_t.fill_(group["momentum"])
@@ -431,15 +453,17 @@ class MuonAdamW(torch.optim.Optimizer):
             self._muon_lr_t.fill_(group["lr"] * max(1.0, shape[-2] / shape[-1])**0.5)
             self._muon_wd_t.fill_(group["weight_decay"])
             muon_step_fused(
-                grad_chunk[:num_owned], stacked_owned,
+                owned_grads, stacked_owned,
                 state["momentum_buffer"][:num_owned], state["second_momentum_buffer"][:num_owned],
                 self._muon_momentum_t, self._muon_lr_t, self._muon_wd_t, self._muon_beta2_t,
                 group["ns_steps"], red_dim,
             )
+            del owned_grads
 
         if info['stacked_grads'] is None:
-            # Single rank: no gather needed, the updated stack maps directly onto the params
-            gather_list.append(dict(future=None, stacked_params=stacked_owned, params=params))
+            # Single rank: copy back immediately and free stacked_owned before the next group
+            if stacked_owned is not None:
+                torch._foreach_copy_(params, list(stacked_owned.unbind(0)))
             return
 
         # Build the input buffer for all_gather

@@ -48,6 +48,7 @@ parser.add_argument("--num-iterations", type=int, default=-1, help="number of op
 parser.add_argument("--max-seq-len", type=int, default=None, help="max context length (default: inherit from pretrain)")
 parser.add_argument("--device-batch-size", type=int, default=None, help="per-device batch size (default: inherit from pretrain)")
 parser.add_argument("--total-batch-size", type=int, default=None, help="total batch size in tokens (default: inherit from pretrain)")
+parser.add_argument("--grad-checkpoint", action=argparse.BooleanOptionalAction, default=None, help="enable activation checkpointing (default: auto, enabled on TPU)")
 # Optimization (default: inherit from pretrained checkpoint)
 parser.add_argument("--embedding-lr", type=float, default=None, help="learning rate for embedding parameters (Adam) (default: inherit from pretrain)")
 parser.add_argument("--unembedding-lr", type=float, default=None, help="learning rate for unembedding parameters (Adam) (default: inherit from pretrain)")
@@ -120,6 +121,11 @@ for name, fallback, source in [
     else:
         print0(f"Using {name}={arg_val}")
 
+grad_checkpoint = (device_type == "tpu") if args.grad_checkpoint is None else args.grad_checkpoint
+user_config["grad_checkpoint"] = grad_checkpoint
+model.grad_checkpoint = grad_checkpoint
+if grad_checkpoint:
+    print0("✓ Activation checkpointing enabled (split-attention)")
 orig_model = model
 model = compile_model(model, dynamic=False)
 depth = model.config.n_layer
@@ -428,10 +434,11 @@ while True:
     # evaluate the gradient
     synchronize()
     t0 = time.time()
+    loss_scale = 1.0 / grad_accum_steps
     for micro_step in range(grad_accum_steps):
-        loss = model(x, y)
-        train_loss = loss.detach() # for logging
-        loss = loss / grad_accum_steps # each .backward() is a grad sum => normalize loss here
+        loss = model(x, y, loss_scale=loss_scale)
+        if micro_step == grad_accum_steps - 1:
+            train_loss = loss.detach() # for logging
         if scaler is not None:
             scaler.scale(loss).backward()
         else:
@@ -455,6 +462,7 @@ while True:
     else:
         optimizer.step()
     model.zero_grad(set_to_none=True)
+    train_loss_f = train_loss.item() * grad_accum_steps
     synchronize()
     t1 = time.time()
     dt = t1 - t0
@@ -464,7 +472,7 @@ while True:
     step += 1
 
     # logging
-    smooth_train_loss = ema_beta * smooth_train_loss + (1 - ema_beta) * train_loss.item() # EMA the training loss
+    smooth_train_loss = ema_beta * smooth_train_loss + (1 - ema_beta) * train_loss_f # EMA the training loss
     debiased_smooth_loss = smooth_train_loss / (1 - ema_beta**(step + 1)) # debias the EMA
     pct_done = 100 * progress
     tok_per_sec = int(args.total_batch_size / dt)
