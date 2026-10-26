@@ -159,29 +159,91 @@ class Block(nn.Module):
         return x
 
     def forward_checkpointed(self, x, x0, resid_lambda, x0_lambda, idx, ve_embed, cos_sin, window_size):
-        """Split-attention activation checkpointing for training.
-        Checkpoints QKV preparation and post-attention + MLP around the attention
-        kernel so attention itself is never recomputed in the backward pass, while
-        large MLP/norm/RoPE/value-embed intermediates are recomputed on the fly."""
-        B, T, _ = x.size()
-        attn = self.attn
-        mlp = self.mlp
-
-        def _prep_qkv(x_in, x0_in, resid_l, x0_l, idx_in):
+        """Activation-checkpointed block forward for training.
+        Checkpoints the entire block so only the block input ``x`` (B, T, D) is saved
+        across forward to backward under AOTAutograd's min-cut partitioner."""
+        def _block(x_in, x0_in, resid_l, x0_l, idx_in):
             x_s = resid_l * x_in + x0_l * x0_in
-            x_n = norm(x_s)
-            ve = ve_embed(idx_in).to(x_n.dtype) if ve_embed is not None else None
-            return attn.project_qkv(x_n, ve, cos_sin)
+            ve = ve_embed(idx_in).to(x_s.dtype) if ve_embed is not None else None
+            return self.forward(x_s, ve, cos_sin, window_size, None)
 
-        q, k, v = checkpoint(_prep_qkv, x, x0, resid_lambda, x0_lambda, idx, use_reentrant=False)
-        y_attn = flash_attn.flash_attn_func(q, k, v, causal=True, window_size=window_size)
+        return checkpoint(_block, x, x0, resid_lambda, x0_lambda, idx, use_reentrant=False)
 
-        def _post_attn_mlp(x_in, x0_in, resid_l, x0_l, y_in):
-            x_s = resid_l * x_in + x0_l * x0_in
-            x_mid = x_s + attn.c_proj(y_in.contiguous().view(B, T, -1))
-            return x_mid + mlp(norm(x_mid))
 
-        return checkpoint(_post_attn_mlp, x, x0, resid_lambda, x0_lambda, y_attn, use_reentrant=False)
+def _linear_softcap_cross_entropy_fwd(x_2d, weight, targets_1d, vocab_size, softcap, reduction):
+    w = (weight[:vocab_size] if vocab_size < weight.size(0) else weight).to(dtype=x_2d.dtype)
+    num_chunks = min(4, max(1, x_2d.size(0) // 2048))
+    if num_chunks <= 1:
+        logits = F.linear(x_2d, w).float()
+        logits = softcap * torch.tanh(logits / softcap)
+        return F.cross_entropy(logits, targets_1d, ignore_index=-1, reduction=reduction)
+    chunk_red = 'none' if reduction == 'none' else 'sum'
+    chunk_losses = []
+    for x_c, t_c in zip(x_2d.chunk(num_chunks), targets_1d.chunk(num_chunks)):
+        logits = F.linear(x_c, w).float()
+        logits = softcap * torch.tanh(logits / softcap)
+        chunk_losses.append(F.cross_entropy(logits, t_c, ignore_index=-1, reduction=chunk_red))
+    if reduction == 'none':
+        return torch.cat(chunk_losses, dim=0)
+    loss = torch.stack(chunk_losses).sum()
+    if reduction == 'mean':
+        loss = loss / (targets_1d != -1).sum().clamp(min=1)
+    return loss
+
+
+class _LinearSoftcapCrossEntropy(torch.autograd.Function):
+    """Fused linear + logit softcap + cross-entropy loss with memory-efficient backward.
+
+    Saves only ``x_2d`` (B*T, D), ``weight``, and ``targets_1d`` (B*T,) from forward
+    to backward instead of ``(B*T, vocab_size)`` fp32 logits, and computes ``grad_x``
+    and ``grad_weight`` in a single backward pass without activation-checkpoint
+    optimization barriers on intermediate vocab-sized tensors.
+    """
+
+    @staticmethod
+    def forward(ctx, x_2d, weight, targets_1d, vocab_size: int, softcap: float, reduction: str):
+        ctx.save_for_backward(x_2d, weight, targets_1d)
+        ctx.vocab_size = vocab_size
+        ctx.softcap = float(softcap)
+        ctx.reduction = reduction
+        return _linear_softcap_cross_entropy_fwd(x_2d, weight, targets_1d, vocab_size, softcap, reduction)
+
+    @staticmethod
+    def backward(ctx, grad_out):
+        x_2d, weight, targets_1d = ctx.saved_tensors
+        vocab_size = ctx.vocab_size
+        softcap = ctx.softcap
+        reduction = ctx.reduction
+
+        w = (weight[:vocab_size] if vocab_size < weight.size(0) else weight).to(dtype=x_2d.dtype)
+        logits_raw = F.linear(x_2d, w).float()
+        t = torch.tanh(logits_raw / softcap)
+        probs = F.softmax(softcap * t, dim=-1)
+
+        valid_mask = targets_1d != -1
+        safe_targets = torch.where(valid_mask, targets_1d, torch.zeros_like(targets_1d))
+        vocab_arange = torch.arange(vocab_size, device=targets_1d.device).unsqueeze(0)
+        one_hot = (safe_targets.unsqueeze(1) == vocab_arange).to(torch.float32)
+
+        dlogits = (probs - one_hot) * (1.0 - t * t)
+        valid_f = valid_mask.to(torch.float32)
+        if reduction == 'mean':
+            scale = (grad_out.float() / valid_f.sum().clamp(min=1)) * valid_f
+        elif reduction == 'sum':
+            scale = grad_out.float() * valid_f
+        else:
+            scale = grad_out.float().view(-1) * valid_f
+        dlogits = dlogits * scale.unsqueeze(1)
+
+        dlogits_bf16 = dlogits.to(dtype=x_2d.dtype)
+        grad_x = dlogits_bf16 @ w
+        grad_w_valid = (dlogits_bf16.t() @ x_2d).to(dtype=weight.dtype)
+        if vocab_size < weight.size(0):
+            grad_w = torch.zeros_like(weight)
+            grad_w[:vocab_size] = grad_w_valid
+        else:
+            grad_w = grad_w_valid
+        return grad_x, grad_w, None, None, None, None
 
 
 class GPT(nn.Module):
@@ -489,12 +551,6 @@ class GPT(nn.Module):
             group["initial_lr"] = group["lr"]
         return optimizer
 
-    def _loss_chunk(self, x_chunk, target_chunk, softcap, reduction):
-        logits = self.lm_head(x_chunk)[..., :self.config.vocab_size]
-        logits = logits.float()
-        logits = softcap * torch.tanh(logits / softcap)
-        return F.cross_entropy(logits, target_chunk, ignore_index=-1, reduction=reduction)
-
     def forward(self, idx, targets=None, kv_cache=None, loss_reduction='mean', loss_scale=None):
         B, T = idx.size()
 
@@ -557,33 +613,21 @@ class GPT(nn.Module):
         # Forward the lm_head (compute logits)
         softcap = 15 # smoothly cap the logits to the range [-softcap, softcap]
         if targets is not None:
-            # training / eval loss: chunk along tokens so full (B, T, vocab_size) fp32
-            # logits + softcap tensors are never materialized all at once in HBM/VRAM
+            # training / eval loss: use custom autograd Function when grad is enabled so
+            # full (B, T, vocab_size) fp32 logits + softcap tensors are never saved across
+            # forward to backward, and backward runs without activation-checkpoint barriers.
             x_flat = x.view(-1, x.size(-1))
             t_flat = targets.view(-1)
-            num_chunks = min(8, max(1, x_flat.size(0) // 1024))
-            grad_enabled = torch.is_grad_enabled()
-            if loss_reduction == 'none':
-                if num_chunks > 1:
-                    chunk_losses = [
-                        checkpoint(self._loss_chunk, x_c, t_c, softcap, 'none', use_reentrant=False)
-                        if grad_enabled else self._loss_chunk(x_c, t_c, softcap, 'none')
-                        for x_c, t_c in zip(x_flat.chunk(num_chunks), t_flat.chunk(num_chunks))
-                    ]
-                    loss = torch.cat(chunk_losses, dim=0)
-                else:
-                    loss = self._loss_chunk(x_flat, t_flat, softcap, 'none')
-            elif num_chunks > 1 or (use_ckpt and grad_enabled):
-                chunk_losses = [
-                    checkpoint(self._loss_chunk, x_c, t_c, softcap, 'sum', use_reentrant=False)
-                    if grad_enabled else self._loss_chunk(x_c, t_c, softcap, 'sum')
-                    for x_c, t_c in zip(x_flat.chunk(num_chunks), t_flat.chunk(num_chunks))
-                ]
-                loss = torch.stack(chunk_losses).sum()
-                if loss_reduction == 'mean':
-                    loss = loss / (t_flat != -1).sum().clamp(min=1)
+            if torch.is_grad_enabled():
+                loss = _LinearSoftcapCrossEntropy.apply(
+                    x_flat, self.lm_head.weight, t_flat,
+                    self.config.vocab_size, softcap, loss_reduction,
+                )
             else:
-                loss = self._loss_chunk(x_flat, t_flat, softcap, loss_reduction)
+                loss = _linear_softcap_cross_entropy_fwd(
+                    x_flat, self.lm_head.weight, t_flat,
+                    self.config.vocab_size, softcap, loss_reduction,
+                )
             if loss_scale is not None:
                 loss = loss * loss_scale
             return loss

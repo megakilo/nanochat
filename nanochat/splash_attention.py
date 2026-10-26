@@ -117,16 +117,16 @@ def _make_splash_attention_fn(
     block_q: int = 512,
     block_kv: int = 512,
     block_kv_compute: int = 512,
-    block_q_dkv: int = 512,
-    block_kv_dkv: int = 512,
-    block_kv_dkv_compute: int = 512,
+    block_q_dkv: int = 256,
+    block_kv_dkv: int = 256,
+    block_kv_dkv_compute: int = 256,
     block_q_dq: int | None = None,
     block_kv_dq: int | None = None,
     use_fused_bwd_kernel: bool = True,
     q_layout: str = "HEAD_DIM_MINOR",
     k_layout: str = "HEAD_DIM_MINOR",
     v_layout: str = "HEAD_DIM_MINOR",
-    use_vmap_bwd: bool = True,
+    use_vmap_bwd: bool = False,
 ):
     """Build JAX Splash forward and backward callables for one static shape.
 
@@ -284,7 +284,11 @@ def _make_splash_attention_fn(
             _, (dq_scaled, dk, dv) = jax.lax.scan(
                 _scan_bwd_body, None, (q_scaled, k, v, out, logsumexp, g),
             )
-        return dq_scaled * scale_arr, dk, dv
+        dq = dq_scaled * scale_arr
+        dq = jax.lax.optimization_barrier(dq)
+        dk = jax.lax.optimization_barrier(dk)
+        dv = jax.lax.optimization_barrier(dv)
+        return dq, dk, dv
 
     return splash_fn, splash_bwd_fn
 
@@ -346,13 +350,13 @@ def splash_sdpa(
     block_kv: int = 512,
     block_dkv: int | None = None,
     block_kv_compute: int = 512,
-    block_q_dkv: int = 512,
-    block_kv_dkv: int = 512,
-    block_kv_dkv_compute: int = 512,
+    block_q_dkv: int = 256,
+    block_kv_dkv: int = 256,
+    block_kv_dkv_compute: int = 256,
     block_q_dq: int | None = None,
     block_kv_dq: int | None = None,
     use_fused_bwd_kernel: bool = True,
-    use_vmap_bwd: bool = True,
+    use_vmap_bwd: bool = False,
     q_layout: str = "HEAD_DIM_MINOR",
     k_layout: str = "HEAD_DIM_MINOR",
     v_layout: str = "HEAD_DIM_MINOR",

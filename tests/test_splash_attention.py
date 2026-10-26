@@ -169,17 +169,20 @@ def test_splash_mixed_windows_compile_single_graph(monkeypatch):
     assert explanation.graph_break_count == 0
 
 
-def test_gpt_grad_checkpoint_and_chunked_loss_no_attn_recompute(monkeypatch):
+def test_gpt_grad_checkpoint_and_fused_loss(monkeypatch):
     import copy
     import types
+    import torch.nn.functional as F
     import nanochat.splash_attention as sa
-    from nanochat.gpt import GPT, GPTConfig
+    from nanochat.gpt import GPT, GPTConfig, _LinearSoftcapCrossEntropy
 
     fwd_calls = []
     bwd_calls = []
 
     def fake_make_splash(**kwargs):
-        assert kwargs.get("use_vmap_bwd") is True
+        assert kwargs.get("use_vmap_bwd") is False
+        assert kwargs.get("block_q_dkv") == 256
+        assert kwargs.get("block_kv_dkv") == 256
 
         def fwd(q, k, v):
             fwd_calls.append(1)
@@ -226,6 +229,31 @@ def test_gpt_grad_checkpoint_and_chunked_loss_no_attn_recompute(monkeypatch):
     )
     monkeypatch.setattr(fa_module, "ATTN_IMPL", "splash")
 
+    # Verify _LinearSoftcapCrossEntropy against exact eager reference (including ignore_index=-1 and padded vocab)
+    for reduction in ("mean", "sum", "none"):
+        x_ref = torch.randn(64, 32, dtype=torch.bfloat16, requires_grad=True)
+        w_ref = torch.randn(128, 32, dtype=torch.float32, requires_grad=True)
+        t_ref = torch.randint(0, 100, (64,), dtype=torch.long)
+        t_ref[::7] = -1
+        logits_ref = 15.0 * torch.tanh(F.linear(x_ref, w_ref[:100].to(x_ref.dtype)).float() / 15.0)
+        out_ref = F.cross_entropy(logits_ref, t_ref, ignore_index=-1, reduction=reduction)
+        if reduction == "none":
+            grad_vec = torch.randn_like(out_ref)
+            out_ref.backward(grad_vec)
+        else:
+            (out_ref * 0.25).backward()
+
+        x_test = x_ref.detach().clone().requires_grad_(True)
+        w_test = w_ref.detach().clone().requires_grad_(True)
+        out_test = _LinearSoftcapCrossEntropy.apply(x_test, w_test, t_ref, 100, 15.0, reduction)
+        if reduction == "none":
+            out_test.backward(grad_vec)
+        else:
+            (out_test * 0.25).backward()
+        torch.testing.assert_close(out_test, out_ref, rtol=1e-5, atol=1e-5)
+        torch.testing.assert_close(x_test.grad, x_ref.grad, rtol=1e-2, atol=1e-2)
+        torch.testing.assert_close(w_test.grad, w_ref.grad, rtol=1e-2, atol=1e-2)
+
     cfg = GPTConfig(
         sequence_len=512, vocab_size=256, n_layer=2, n_head=2, n_kv_head=2, n_embd=256, window_pattern="SL"
     )
@@ -255,8 +283,8 @@ def test_gpt_grad_checkpoint_and_chunked_loss_no_attn_recompute(monkeypatch):
     loss_ckpt = compiled_ckpt(idx, targets, loss_scale=0.25)
     loss_ckpt.backward()
 
-    # Splash Attention forward must run once per layer (never recomputed during backward)
-    assert len(fwd_calls) == cfg.n_layer
+    # Full-block checkpointing runs forward once in fw and once in bw per layer
+    assert len(fwd_calls) == 2 * cfg.n_layer
     assert len(bwd_calls) == cfg.n_layer
     torch.testing.assert_close(loss_ref, loss_ckpt, rtol=1e-5, atol=1e-5)
     for (n1, p1), (n2, p2) in zip(m_ref.named_parameters(), m_ckpt.named_parameters()):

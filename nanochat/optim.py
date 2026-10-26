@@ -418,6 +418,9 @@ class MuonAdamW(torch.optim.Optimizer):
                 future = dist.all_gather_into_tensor(p, p_slice, async_op=True).get_future()
                 gather_list.append(dict(future=future, params=None))
 
+        if world_size == 1 and first_dev.type == "tpu":
+            torch.accelerator.synchronize()
+
     def _compute_muon(self, group: dict, info: dict, gather_list: list, rank: int) -> None:
         """Wait for reduce, compute Muon updates, launch gather."""
         if info['future'] is not None:
@@ -464,6 +467,9 @@ class MuonAdamW(torch.optim.Optimizer):
             # Single rank: copy back immediately and free stacked_owned before the next group
             if stacked_owned is not None:
                 torch._foreach_copy_(params, list(stacked_owned.unbind(0)))
+                del stacked_owned
+                if device.type == "tpu":
+                    torch.accelerator.synchronize()
             return
 
         # Build the input buffer for all_gather

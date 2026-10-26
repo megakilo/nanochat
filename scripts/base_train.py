@@ -531,6 +531,8 @@ while True:
             scaler.scale(loss).backward()
         else:
             loss.backward()
+        if device_type == "tpu":
+            synchronize()
         x, y, dataloader_state_dict = next(train_loader) # prefetch the next batch while the GPU is busy with forward/backward
     # step the optimizer
     lrm = get_lr_multiplier(step)
