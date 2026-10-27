@@ -36,7 +36,7 @@ parser = argparse.ArgumentParser(description="Supervised fine-tuning (SFT) the m
 # Logging
 parser.add_argument("--run", type=str, default="dummy", help="wandb run name ('dummy' disables wandb logging)")
 # Runtime
-parser.add_argument("--device-type", type=str, default="", help="cuda|cpu|mps|tpu (empty = autodetect)")
+parser.add_argument("--device-type", type=str, default="", help="tpu|cpu (empty = autodetect)")
 parser.add_argument("--attn-impl", type=str, default=None, choices=VALID_IMPLS, help="attention backend (default: $NANOCHAT_ATTN_IMPL or auto)")
 # Model loading
 parser.add_argument("--model-tag", type=str, default=None, help="model tag to load from")
@@ -77,19 +77,18 @@ master_process = ddp_rank == 0
 print0(f"COMPUTE_DTYPE: {COMPUTE_DTYPE} ({COMPUTE_DTYPE_REASON})")
 synchronize = device_synchronize(device_type)
 get_max_memory = device_peak_memory(device_type)
-if device_type in ("cuda", "tpu"):
+if device_type == "tpu":
     accel_name = get_device_name(device_type)
-    gpu_peak_flops = get_peak_flops(accel_name)
-    kind = "GPU" if device_type == "cuda" else "TPU"
-    print0(f"{kind}: {accel_name} | Peak FLOPS (BF16): {gpu_peak_flops:.2e}")
+    tpu_peak_flops = get_peak_flops(accel_name)
+    print0(f"TPU: {accel_name} | Peak FLOPS (BF16): {tpu_peak_flops:.2e}")
 else:
-    gpu_peak_flops = float('inf')  # MFU not meaningful for CPU/MPS
+    tpu_peak_flops = float('inf')
 
-# Flash Attention status
+# Attention status
 attn_impl = set_attn_impl(args.attn_impl)  # None => $NANOCHAT_ATTN_IMPL or auto
 user_config["attn_impl"] = attn_impl
 if attn_impl == "sdpa":
-    print0("WARNING: Flash Attention 2/3/4 not available (or SDPA requested), using PyTorch SDPA fallback. Training will be less efficient.")
+    print0("WARNING: Splash Attention not available (or SDPA requested), using PyTorch SDPA fallback.")
 else:
     print0(f"✓ Using {ATTN_IMPL_NAMES[attn_impl]}")
 
@@ -159,11 +158,6 @@ if args.load_optimizer:
         print0("Loaded optimizer state from pretrained checkpoint (momentum buffers only, LRs reset)")
     else:
         print0("WARNING: optimizer checkpoint not found, starting with fresh optimizer (slightly worse)")
-
-# GradScaler for fp16 training (bf16/fp32 don't need it)
-scaler = torch.amp.GradScaler() if COMPUTE_DTYPE == torch.float16 else None
-if scaler is not None:
-    print0("GradScaler enabled for fp16 training")
 
 # Override the initial learning rate as a fraction of the base learning rate
 for group in optimizer.param_groups:
@@ -289,7 +283,7 @@ def sft_data_generator_bos_bestfit(split, buffer_size=100):
                 last_step = True
 
         # Build tensors
-        use_accel = device_type in ("cuda", "tpu")
+        use_accel = device_type == "tpu"
         batch_tensor = torch.tensor(rows, dtype=torch.long, pin_memory=use_accel)
         inputs = batch_tensor[:, :-1].to(device=device, dtype=torch.int32, non_blocking=use_accel).contiguous()
         targets = batch_tensor[:, 1:].to(device=device, dtype=torch.int64, non_blocking=use_accel).contiguous()
@@ -439,13 +433,10 @@ while True:
         loss = model(x, y, loss_scale=loss_scale)
         if micro_step == grad_accum_steps - 1:
             train_loss = loss.detach() # for logging
-        if scaler is not None:
-            scaler.scale(loss).backward()
-        else:
-            loss.backward()
-        if device_type == "tpu":
+        loss.backward()
+        if device_type == "tpu" and ((micro_step + 1) % 4 == 0 or micro_step == grad_accum_steps - 1):
             synchronize()
-        x, y = next(train_loader) # prefetch the next batch while the GPU is busy with forward/backward
+        x, y = next(train_loader) # prefetch the next batch while the TPU is busy with forward/backward
         progress = max(progress, approx_progress) # only increase progress monotonically
     # step the optimizer
     lrm = get_lr_multiplier(progress)
@@ -454,15 +445,7 @@ while True:
         group["lr"] = group["initial_lr"] * lrm
         if group['kind'] == 'muon':
             group["momentum"] = muon_momentum
-    if scaler is not None:
-        scaler.unscale_(optimizer)
-        if is_ddp_initialized():
-            for v in scaler._found_inf_per_device(optimizer).values():
-                dist.all_reduce(v, op=dist.ReduceOp.MAX)
-        scaler.step(optimizer)
-        scaler.update()
-    else:
-        optimizer.step()
+    optimizer.step()
     model.zero_grad(set_to_none=True)
     train_loss_f = train_loss.item() * grad_accum_steps
     synchronize()
@@ -479,7 +462,7 @@ while True:
     pct_done = 100 * progress
     tok_per_sec = int(args.total_batch_size / dt)
     flops_per_sec = num_flops_per_token * args.total_batch_size / dt
-    mfu = 100 * flops_per_sec / (gpu_peak_flops * ddp_world_size)
+    mfu = 100 * flops_per_sec / (tpu_peak_flops * ddp_world_size)
     if step > 10:
         total_training_time += dt # only count the time after the first 10 steps
     print0(f"step {step:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | mfu: {mfu:.2f} | epoch: {current_epoch} | total time: {total_training_time/60:.2f}m")

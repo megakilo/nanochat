@@ -9,10 +9,9 @@ Notable features:
 - no learnable params in rmsnorm
 - no bias in linear layers
 - Group-Query Attention (GQA) support for more efficient inference
-- Flash Attention 3 integration
+- TPU Splash Attention integration
 """
 
-from functools import partial
 from dataclasses import dataclass
 
 import torch
@@ -20,10 +19,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 
-from nanochat.common import get_dist_info, print0, COMPUTE_DTYPE
+from nanochat.common import print0, COMPUTE_DTYPE
 from nanochat.optim import MuonAdamW
-
-# Our custom Flash Attention module that automatically uses FA3 when compatible and SDPA fallback otherwise
 from nanochat.flash_attention import flash_attn
 
 @dataclass
@@ -40,15 +37,83 @@ class GPTConfig:
     window_pattern: str = "SSSL"
 
 
-def norm(x):
-    return F.rms_norm(x, (x.size(-1),)) # note that this will run in bf16, seems ok
+class _RMSNormFn(torch.autograd.Function):
+    """Memory-efficient RMSNorm (with optional output scale).
+
+    Saves the normalized output ``y`` and ``rstd`` instead of the pre-norm input ``x``.
+    When ``y`` is consumed by downstream Linear layers or Splash Attention, AOTAutograd
+    deduplicates the saved ``y`` tensor so the pre-norm input ``x`` is never saved
+    across forward to backward.
+    """
+
+    @staticmethod
+    def forward(ctx, x, scale: float = 1.0):
+        eps = torch.finfo(torch.float32).eps
+        x_f = x.float()
+        rstd = torch.rsqrt(x_f.square().mean(dim=-1, keepdim=True) + eps)
+        y = (x_f * rstd).to(dtype=x.dtype)
+        if scale != 1.0:
+            y = y * scale
+        ctx.save_for_backward(y, rstd)
+        ctx.scale = scale
+        return y
+
+    @staticmethod
+    def backward(ctx, grad_out):
+        y, rstd = ctx.saved_tensors
+        scale = ctx.scale
+        g_f = grad_out.float()
+        y_unit = y.float() * (1.0 / scale) if scale != 1.0 else y.float()
+        grad_y_norm = g_f * scale if scale != 1.0 else g_f
+        grad_x = rstd * (grad_y_norm - y_unit * (grad_y_norm * y_unit).mean(dim=-1, keepdim=True))
+        return grad_x.to(dtype=y.dtype), None
+
+
+def norm(x, scale: float = 1.0):
+    if torch.is_grad_enabled():
+        return _RMSNormFn.apply(x, scale)
+    y = F.rms_norm(x, (x.size(-1),))
+    return y * scale if scale != 1.0 else y
+
+
+class _CastLinearFn(torch.autograd.Function):
+    """Linear layer with fp32 master weights cast to activation dtype in forward and backward.
+
+    Using a custom autograd Function prevents AOTAutograd's min-cut partitioner
+    from saving cast bf16 weight copies (1.27 GiB on d24) as forward-to-backward
+    activations alongside the fp32 master weights. Also accepts 4D ``(B, T, H, D)``
+    views (such as attention outputs) so ``c_proj`` shares saved storage with the
+    attention output tensor without saving a second contiguous copy.
+    """
+
+    @staticmethod
+    def forward(ctx, x, weight):
+        ctx.save_for_backward(x, weight)
+        x_2d = x.contiguous().view(-1, weight.size(1))
+        out = F.linear(x_2d, weight.to(dtype=x.dtype))
+        return out.view(*x.shape[:2], weight.size(0)) if x.ndim > 2 else out
+
+    @staticmethod
+    def backward(ctx, grad_out):
+        x, weight = ctx.saved_tensors
+        dtype = x.dtype
+        w_t = weight.t().to(dtype=dtype)
+        go_2d = grad_out.reshape(-1, weight.size(0))
+        x_2d = x.reshape(-1, weight.size(1))
+        grad_x = (go_2d @ w_t.t()).view_as(x)
+        grad_w = (go_2d.t() @ x_2d).to(dtype=weight.dtype)
+        return grad_x, grad_w
+
 
 class Linear(nn.Linear):
     """nn.Linear that casts weights to match input dtype in forward.
     Replaces autocast: master weights stay fp32 for optimizer precision,
     but matmuls run in the activation dtype (typically bf16 from embeddings)."""
     def forward(self, x):
-        return F.linear(x, self.weight.to(dtype=x.dtype))
+        if torch.is_grad_enabled():
+            return _CastLinearFn.apply(x, self.weight)
+        x_in = x.contiguous().view(*x.shape[:2], -1) if x.ndim > 3 else x
+        return F.linear(x_in, self.weight.to(dtype=x.dtype))
 
 
 def has_ve(layer_idx, n_layer):
@@ -82,11 +147,10 @@ class CausalSelfAttention(nn.Module):
         self.ve_gate_channels = 12
         self.ve_gate = Linear(self.ve_gate_channels, self.n_kv_head, bias=False) if has_ve(layer_idx, config.n_layer) else None
 
-    def project_qkv(self, x, ve, cos_sin):
+    def project_qkv(self, x, ve, cos_sin, bhtd=False):
         B, T, _ = x.size()
 
         # Project the input to get queries, keys, and values
-        # Shape: (B, T, H, D) - FA3's native layout, no transpose needed!
         q = self.c_q(x).view(B, T, self.n_head, self.head_dim)
         k = self.c_k(x).view(B, T, self.n_kv_head, self.head_dim)
         v = self.c_v(x).view(B, T, self.n_kv_head, self.head_dim)
@@ -100,20 +164,24 @@ class CausalSelfAttention(nn.Module):
         # Apply Rotary Embeddings to queries and keys to get relative positional encoding
         cos, sin = cos_sin
         q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
-        q, k = norm(q), norm(k) # QK norm
-        q = q * 1.2  # sharper attention (split scale between Q and K), TODO think through better
-        k = k * 1.2
+        if bhtd:
+            q = q.transpose(1, 2).contiguous()
+            k = k.transpose(1, 2).contiguous()
+            v = v.transpose(1, 2).contiguous()
+        q = norm(q, scale=1.2)  # QK norm + 1.2x sharper attention
+        k = norm(k, scale=1.2)
         return q, k, v
 
     def forward(self, x, ve, cos_sin, window_size, kv_cache):
-        B, T, _ = x.size()
-        q, k, v = self.project_qkv(x, ve, cos_sin)
+        _, T, _ = x.size()
+        bhtd = kv_cache is None
+        q, k, v = self.project_qkv(x, ve, cos_sin, bhtd=bhtd)
 
-        # Flash Attention (FA3 or SDPA fallback)
+        # Attention (TPU Splash Attention or SDPA fallback)
         # window_size is (left, right) tuple: (N, 0) for causal, (-1, 0) for full context
         if kv_cache is None:
             # Training: causal attention with optional sliding window
-            y = flash_attn.flash_attn_func(q, k, v, causal=True, window_size=window_size)
+            y = flash_attn.flash_attn_func(q, k, v, causal=True, window_size=window_size, bhtd=True)
         else:
             # Inference: use flash_attn_with_kvcache which handles cache management
             k_cache, v_cache = kv_cache.get_layer_cache(self.layer_idx)
@@ -128,10 +196,69 @@ class CausalSelfAttention(nn.Module):
             if self.layer_idx == kv_cache.n_layers - 1:
                 kv_cache.advance(T)
 
-        # Re-assemble the heads and project back to residual stream
-        y = y.contiguous().view(B, T, -1)
+        # Project heads back to residual stream (Linear handles (B, T, H, D) views directly)
         y = self.c_proj(y)
         return y
+
+
+class _FusedNormMLP(torch.autograd.Function):
+    """Fused residual + RMSNorm + ReLU^2 MLP with custom backward.
+
+    Computes ``x + c_proj(relu(c_fc(rms_norm(x)))^2)`` without saving ``rms_norm(x)``
+    or ``relu(h)^2`` across forward to backward. When ``recompute_cfc=True``, only
+    ``x`` (B, T, D) is saved (recomputing ``c_fc`` in backward), reducing MLP saved
+    activations by 8x without triggering ``tpu._optimization_barrier`` or recomputing
+    Splash Attention.
+    """
+
+    @staticmethod
+    def forward(ctx, x, w_fc, w_proj, recompute_cfc: bool):
+        B, T, D = x.size()
+        dtype = x.dtype
+        x_norm = F.rms_norm(x, (D,))
+        h = F.linear(x_norm, w_fc.to(dtype))
+        z = F.relu(h).square()
+        out = x + F.linear(z, w_proj.to(dtype))
+        ctx.recompute_cfc = recompute_cfc
+        if recompute_cfc:
+            ctx.save_for_backward(x, w_fc, w_proj)
+        else:
+            ctx.save_for_backward(x, h, w_fc, w_proj)
+        return out
+
+    @staticmethod
+    def backward(ctx, grad_out):
+        if ctx.recompute_cfc:
+            x, w_fc, w_proj = ctx.saved_tensors
+            h = None
+        else:
+            x, h, w_fc, w_proj = ctx.saved_tensors
+        B, T, D = x.size()
+        dtype = x.dtype
+        w_fc_t = w_fc.t().to(dtype)
+        w_proj_t = w_proj.t().to(dtype)
+
+        eps = torch.finfo(torch.float32).eps
+        x_f = x.float()
+        rstd = torch.rsqrt(x_f.square().mean(dim=-1, keepdim=True) + eps)
+        x_norm_f = x_f * rstd
+        xn_2d = x_norm_f.to(dtype).reshape(B * T, D)
+
+        if h is None:
+            h = (xn_2d @ w_fc_t).view(B, T, -1)
+        relu_h = torch.clamp_min(h, 0)
+        z = relu_h * relu_h
+
+        go_2d = grad_out.reshape(B * T, D)
+        z_2d = z.reshape(B * T, -1)
+        grad_w_proj = (go_2d.t() @ z_2d).to(w_proj.dtype)
+        grad_z = (go_2d @ w_proj_t.t()).view_as(z)
+        grad_h = (grad_z * (relu_h + relu_h)).to(dtype)
+        gh_2d = grad_h.reshape(B * T, -1)
+        grad_w_fc = (gh_2d.t() @ xn_2d).to(w_fc.dtype)
+        grad_x_norm = (gh_2d @ w_fc_t.t()).view(B, T, D).float()
+        grad_x = grad_out + (rstd * (grad_x_norm - x_norm_f * (grad_x_norm * x_norm_f).mean(dim=-1, keepdim=True))).to(dtype)
+        return grad_x, grad_w_fc, grad_w_proj, None
 
 
 class MLP(nn.Module):
@@ -153,26 +280,38 @@ class Block(nn.Module):
         self.attn = CausalSelfAttention(config, layer_idx)
         self.mlp = MLP(config)
 
-    def forward(self, x, ve, cos_sin, window_size, kv_cache):
+    def forward(self, x, ve, cos_sin, window_size, kv_cache, recompute_mlp=False):
         x = x + self.attn(norm(x), ve, cos_sin, window_size, kv_cache)
-        x = x + self.mlp(norm(x))
+        if torch.is_grad_enabled():
+            x = _FusedNormMLP.apply(x, self.mlp.c_fc.weight, self.mlp.c_proj.weight, recompute_mlp)
+        else:
+            x = x + self.mlp(norm(x))
         return x
 
-    def forward_checkpointed(self, x, x0, resid_lambda, x0_lambda, idx, ve_embed, cos_sin, window_size):
+    def forward_checkpointed(self, x, x0, resid_lambda, x0_lambda, idx, ve_embed, cos_sin, window_size, full_recompute=False):
         """Activation-checkpointed block forward for training.
-        Checkpoints the entire block so only the block input ``x`` (B, T, D) is saved
-        across forward to backward under AOTAutograd's min-cut partitioner."""
+
+        When ``full_recompute=False`` (default for B*T <= 8192), checkpoints the MLP
+        via ``_FusedNormMLP`` while keeping attention activations in memory — eliminating
+        all Splash Attention forward recomputations and ``tpu._optimization_barrier`` ops.
+        When ``full_recompute=True``, checkpoints the entire block so only ``x`` is saved.
+        """
+        if not full_recompute:
+            x_s = resid_lambda * x + x0_lambda * x0
+            ve = ve_embed(idx).to(x_s.dtype) if ve_embed is not None else None
+            return self.forward(x_s, ve, cos_sin, window_size, None, recompute_mlp=True)
+
         def _block(x_in, x0_in, resid_l, x0_l, idx_in):
             x_s = resid_l * x_in + x0_l * x0_in
             ve = ve_embed(idx_in).to(x_s.dtype) if ve_embed is not None else None
-            return self.forward(x_s, ve, cos_sin, window_size, None)
+            return self.forward(x_s, ve, cos_sin, window_size, None, recompute_mlp=True)
 
         return checkpoint(_block, x, x0, resid_lambda, x0_lambda, idx, use_reentrant=False)
 
 
 def _linear_softcap_cross_entropy_fwd(x_2d, weight, targets_1d, vocab_size, softcap, reduction):
     w = (weight[:vocab_size] if vocab_size < weight.size(0) else weight).to(dtype=x_2d.dtype)
-    num_chunks = min(4, max(1, x_2d.size(0) // 2048))
+    num_chunks = min(2, max(1, x_2d.size(0) // 4096))
     if num_chunks <= 1:
         logits = F.linear(x_2d, w).float()
         logits = softcap * torch.tanh(logits / softcap)
@@ -191,13 +330,26 @@ def _linear_softcap_cross_entropy_fwd(x_2d, weight, targets_1d, vocab_size, soft
     return loss
 
 
+def _linear_softcap_cross_entropy_bwd_chunk(x_c, w_t, t_c, vocab_arange, softcap, scale_c):
+    logits_raw = (x_c @ w_t).float()
+    t = torch.tanh(logits_raw / softcap)
+    probs = F.softmax(softcap * t, dim=-1)
+    valid_mask = t_c != -1
+    safe_targets = torch.where(valid_mask, t_c, torch.zeros_like(t_c))
+    one_hot = (safe_targets.unsqueeze(1) == vocab_arange).to(torch.float32)
+    dlogits = (probs - one_hot) * (1.0 - t * t) * scale_c.unsqueeze(1)
+    dlogits_bf16 = dlogits.to(dtype=x_c.dtype)
+    grad_x_c = dlogits_bf16 @ w_t.t()
+    grad_w_c = (dlogits_bf16.t() @ x_c).to(dtype=torch.float32)
+    return grad_x_c, grad_w_c
+
+
 class _LinearSoftcapCrossEntropy(torch.autograd.Function):
     """Fused linear + logit softcap + cross-entropy loss with memory-efficient backward.
 
     Saves only ``x_2d`` (B*T, D), ``weight``, and ``targets_1d`` (B*T,) from forward
     to backward instead of ``(B*T, vocab_size)`` fp32 logits, and computes ``grad_x``
-    and ``grad_weight`` in a single backward pass without activation-checkpoint
-    optimization barriers on intermediate vocab-sized tensors.
+    and ``grad_weight`` without activation-checkpoint optimization barriers.
     """
 
     @staticmethod
@@ -215,29 +367,35 @@ class _LinearSoftcapCrossEntropy(torch.autograd.Function):
         softcap = ctx.softcap
         reduction = ctx.reduction
 
-        w = (weight[:vocab_size] if vocab_size < weight.size(0) else weight).to(dtype=x_2d.dtype)
-        logits_raw = F.linear(x_2d, w).float()
-        t = torch.tanh(logits_raw / softcap)
-        probs = F.softmax(softcap * t, dim=-1)
+        w_slice = weight[:vocab_size] if vocab_size < weight.size(0) else weight
+        w_t = w_slice.t().to(dtype=x_2d.dtype)
 
-        valid_mask = targets_1d != -1
-        safe_targets = torch.where(valid_mask, targets_1d, torch.zeros_like(targets_1d))
-        vocab_arange = torch.arange(vocab_size, device=targets_1d.device).unsqueeze(0)
-        one_hot = (safe_targets.unsqueeze(1) == vocab_arange).to(torch.float32)
-
-        dlogits = (probs - one_hot) * (1.0 - t * t)
-        valid_f = valid_mask.to(torch.float32)
+        valid_f = (targets_1d != -1).to(torch.float32)
         if reduction == 'mean':
             scale = (grad_out.float() / valid_f.sum().clamp(min=1)) * valid_f
         elif reduction == 'sum':
             scale = grad_out.float() * valid_f
         else:
             scale = grad_out.float().view(-1) * valid_f
-        dlogits = dlogits * scale.unsqueeze(1)
 
-        dlogits_bf16 = dlogits.to(dtype=x_2d.dtype)
-        grad_x = dlogits_bf16 @ w
-        grad_w_valid = (dlogits_bf16.t() @ x_2d).to(dtype=weight.dtype)
+        vocab_arange = torch.arange(vocab_size, device=targets_1d.device).unsqueeze(0)
+        num_chunks = max(1, x_2d.size(0) // 8192)
+        if num_chunks <= 1:
+            grad_x, grad_w_f32 = _linear_softcap_cross_entropy_bwd_chunk(
+                x_2d, w_t, targets_1d, vocab_arange, softcap, scale
+            )
+        else:
+            grad_x_chunks = []
+            grad_w_f32 = None
+            for x_c, t_c, s_c in zip(x_2d.chunk(num_chunks), targets_1d.chunk(num_chunks), scale.chunk(num_chunks)):
+                gx_c, gw_c = _linear_softcap_cross_entropy_bwd_chunk(
+                    x_c, w_t, t_c, vocab_arange, softcap, s_c
+                )
+                grad_x_chunks.append(gx_c)
+                grad_w_f32 = gw_c if grad_w_f32 is None else (grad_w_f32 + gw_c)
+            grad_x = torch.cat(grad_x_chunks, dim=0)
+
+        grad_w_valid = grad_w_f32.to(dtype=weight.dtype)
         if vocab_size < weight.size(0):
             grad_w = torch.zeros_like(weight)
             grad_w[:vocab_size] = grad_w_valid
@@ -353,13 +511,10 @@ class GPT(nn.Module):
         cos, sin = self._precompute_rotary_embeddings(self.rotary_seq_len, head_dim)
         self.cos, self.sin = cos, sin
 
-        # Cast embeddings to COMPUTE_DTYPE: optimizer can tolerate reduced-precision
-        # embeddings and it saves memory. Exception: fp16 requires fp32 embeddings
-        # because GradScaler cannot unscale fp16 gradients.
-        if COMPUTE_DTYPE != torch.float16:
-            self.transformer.wte.to(dtype=COMPUTE_DTYPE)
-            for ve in self.value_embeds.values():
-                ve.to(dtype=COMPUTE_DTYPE)
+        # Cast embeddings to COMPUTE_DTYPE (bf16 on TPU) to save memory
+        self.transformer.wte.to(dtype=COMPUTE_DTYPE)
+        for ve in self.value_embeds.values():
+            ve.to(dtype=COMPUTE_DTYPE)
 
     def _precompute_rotary_embeddings(self, seq_len, head_dim, base=100000, device=None):
         # TODO: bump base theta more? e.g. 100K is more common more recently
@@ -591,13 +746,15 @@ class GPT(nn.Module):
         n_layer = self.config.n_layer
         backout_layer = n_layer // 2  # cache at halfway point
         x_backout = None
-        use_ckpt = self.grad_checkpoint and self.training and kv_cache is None and torch.is_grad_enabled()
+        use_ckpt = bool(self.grad_checkpoint) and self.training and kv_cache is None and torch.is_grad_enabled()
+        full_recompute = (self.grad_checkpoint == "full") or (B * T > 8192)
         for i, block in enumerate(self.transformer.h):
             ve_embed = self.value_embeds[str(i)] if str(i) in self.value_embeds else None
             if use_ckpt:
                 x = block.forward_checkpointed(
                     x, x0, self.resid_lambdas[i], self.x0_lambdas[i],
                     idx, ve_embed, cos_sin, self.window_sizes[i],
+                    full_recompute=full_recompute,
                 )
             else:
                 x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0

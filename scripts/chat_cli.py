@@ -17,7 +17,7 @@ parser.add_argument('-s', '--step', type=int, default=None, help='Step to load')
 parser.add_argument('-p', '--prompt', type=str, default='', help='Prompt the model, get a single response back')
 parser.add_argument('-t', '--temperature', type=float, default=0.6, help='Temperature for generation')
 parser.add_argument('-k', '--top-k', type=int, default=50, help='Top-k sampling parameter')
-parser.add_argument('--device-type', type=str, default='', choices=['cuda', 'cpu', 'mps', 'tpu'], help='Device type for evaluation: cuda|cpu|mps|tpu. empty => autodetect')
+parser.add_argument('--device-type', type=str, default='', choices=['tpu', 'cpu'], help='Device type for evaluation: tpu|cpu. empty => autodetect')
 args = parser.parse_args()
 
 # Init the model and tokenizer

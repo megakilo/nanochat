@@ -418,7 +418,7 @@ class MuonAdamW(torch.optim.Optimizer):
                 future = dist.all_gather_into_tensor(p, p_slice, async_op=True).get_future()
                 gather_list.append(dict(future=future, params=None))
 
-        if world_size == 1 and first_dev.type == "tpu":
+        if world_size == 1 and first_dev.type == "tpu" and sum(p.numel() for p in group['params']) > 1_000_000:
             torch.accelerator.synchronize()
 
     def _compute_muon(self, group: dict, info: dict, gather_list: list, rank: int) -> None:

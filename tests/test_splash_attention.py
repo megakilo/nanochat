@@ -72,13 +72,12 @@ def test_splash_requires_tpu():
     assert fa_module.USE_SPLASH is False
 
 
-def test_tpu_peak_flops_do_not_steal_gpu_names():
+def test_tpu_peak_flops():
     assert get_peak_flops("TPU v6e") == 918e12
     assert get_peak_flops("tpu v5p") == 459e12
     assert get_peak_flops("v5litepod-16") == 197e12
     assert get_peak_flops("Ironwood") == 4.614e15
-    # A GPU name must still resolve to the GPU table, not a TPU substring.
-    assert get_peak_flops("NVIDIA H100 80GB HBM3") == 989e12
+    assert get_peak_flops("unknown") == float("inf")
 
 
 def test_compile_model_leaves_cpu_backend_default(monkeypatch):
@@ -180,9 +179,9 @@ def test_gpt_grad_checkpoint_and_fused_loss(monkeypatch):
     bwd_calls = []
 
     def fake_make_splash(**kwargs):
-        assert kwargs.get("use_vmap_bwd") is False
-        assert kwargs.get("block_q_dkv") == 256
-        assert kwargs.get("block_kv_dkv") == 256
+        assert kwargs.get("use_vmap_bwd") is True
+        assert kwargs.get("block_q_dkv") == 512
+        assert kwargs.get("block_kv_dkv") == 512
 
         def fwd(q, k, v):
             fwd_calls.append(1)
@@ -283,11 +282,27 @@ def test_gpt_grad_checkpoint_and_fused_loss(monkeypatch):
     loss_ckpt = compiled_ckpt(idx, targets, loss_scale=0.25)
     loss_ckpt.backward()
 
-    # Full-block checkpointing runs forward once in fw and once in bw per layer
-    assert len(fwd_calls) == 2 * cfg.n_layer
+    # Default TPU checkpointing (grad_checkpoint=True) does NOT recompute Splash Attention forward in backward
+    assert len(fwd_calls) == cfg.n_layer
     assert len(bwd_calls) == cfg.n_layer
     torch.testing.assert_close(loss_ref, loss_ckpt, rtol=1e-5, atol=1e-5)
     for (n1, p1), (n2, p2) in zip(m_ref.named_parameters(), m_ckpt.named_parameters()):
+        assert n1 == n2
+        torch.testing.assert_close(p1.grad, p2.grad, rtol=1e-4, atol=1e-4)
+
+    # Full-block checkpointing (grad_checkpoint="full") runs Splash forward once in fw and once in bw per layer
+    m_full = copy.deepcopy(m_ref)
+    m_full.zero_grad(set_to_none=True)
+    m_full.grad_checkpoint = "full"
+    fwd_calls.clear()
+    bwd_calls.clear()
+    compiled_full = torch.compile(m_full, backend="aot_eager", dynamic=False)
+    loss_full = compiled_full(idx, targets, loss_scale=0.25)
+    loss_full.backward()
+    assert len(fwd_calls) == 2 * cfg.n_layer
+    assert len(bwd_calls) == cfg.n_layer
+    torch.testing.assert_close(loss_ref, loss_full, rtol=1e-5, atol=1e-5)
+    for (n1, p1), (n2, p2) in zip(m_ref.named_parameters(), m_full.named_parameters()):
         assert n1 == n2
         torch.testing.assert_close(p1.grad, p2.grad, rtol=1e-4, atol=1e-4)
 

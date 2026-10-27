@@ -117,16 +117,16 @@ def _make_splash_attention_fn(
     block_q: int = 512,
     block_kv: int = 512,
     block_kv_compute: int = 512,
-    block_q_dkv: int = 256,
-    block_kv_dkv: int = 256,
-    block_kv_dkv_compute: int = 256,
+    block_q_dkv: int = 512,
+    block_kv_dkv: int = 512,
+    block_kv_dkv_compute: int = 512,
     block_q_dq: int | None = None,
     block_kv_dq: int | None = None,
     use_fused_bwd_kernel: bool = True,
     q_layout: str = "HEAD_DIM_MINOR",
     k_layout: str = "HEAD_DIM_MINOR",
     v_layout: str = "HEAD_DIM_MINOR",
-    use_vmap_bwd: bool = False,
+    use_vmap_bwd: bool = True,
 ):
     """Build JAX Splash forward and backward callables for one static shape.
 
@@ -350,13 +350,13 @@ def splash_sdpa(
     block_kv: int = 512,
     block_dkv: int | None = None,
     block_kv_compute: int = 512,
-    block_q_dkv: int = 256,
-    block_kv_dkv: int = 256,
-    block_kv_dkv_compute: int = 256,
+    block_q_dkv: int = 512,
+    block_kv_dkv: int = 512,
+    block_kv_dkv_compute: int = 512,
     block_q_dq: int | None = None,
     block_kv_dq: int | None = None,
     use_fused_bwd_kernel: bool = True,
-    use_vmap_bwd: bool = False,
+    use_vmap_bwd: bool = True,
     q_layout: str = "HEAD_DIM_MINOR",
     k_layout: str = "HEAD_DIM_MINOR",
     v_layout: str = "HEAD_DIM_MINOR",
@@ -375,6 +375,7 @@ def splash_sdpa(
     if block_dkv is not None:
         block_q_dkv = block_dkv
         block_kv_dkv = block_dkv
+        block_kv_dkv_compute = block_dkv
     vmap_env = os.environ.get("SPLASH_VMAP_BWD")
     if vmap_env is not None:
         use_vmap_bwd = vmap_env.strip().lower() not in ("0", "false", "no")

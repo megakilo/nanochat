@@ -34,7 +34,7 @@ parser = argparse.ArgumentParser(description="Reinforcement learning on GSM8K")
 # Logging
 parser.add_argument("--run", type=str, default="dummy", help="wandb run name ('dummy' disables wandb logging)")
 # Runtime
-parser.add_argument("--device-type", type=str, default="", help="cuda|cpu|mps|tpu (empty = autodetect)")
+parser.add_argument("--device-type", type=str, default="", help="tpu|cpu (empty = autodetect)")
 parser.add_argument("--attn-impl", type=str, default=None, choices=VALID_IMPLS, help="attention backend (default: $NANOCHAT_ATTN_IMPL or auto)")
 # Model loading
 parser.add_argument("--model-tag", type=str, default=None, help="model tag to load from")
@@ -68,11 +68,11 @@ device_type = autodetect_device_type() if args.device_type == "" else args.devic
 ddp, ddp_rank, ddp_local_rank, ddp_world_size, device = compute_init(device_type)
 master_process = ddp_rank == 0 # this process will do logging, checkpointing etc.
 
-# Flash Attention status
+# Attention status
 attn_impl = set_attn_impl(args.attn_impl)  # None => $NANOCHAT_ATTN_IMPL or auto
 user_config["attn_impl"] = attn_impl
 if attn_impl == "sdpa":
-    print0("WARNING: Flash Attention 2/3/4 not available (or SDPA requested), using PyTorch SDPA fallback.")
+    print0("WARNING: Splash Attention not available (or SDPA requested), using PyTorch SDPA fallback.")
 else:
     print0(f"✓ Using {ATTN_IMPL_NAMES[attn_impl]}")
 

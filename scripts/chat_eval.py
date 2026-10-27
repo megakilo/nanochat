@@ -189,7 +189,7 @@ if __name__ == "__main__":
     parser.add_argument('-g', '--model-tag', type=str, default=None, help='Model tag to load')
     parser.add_argument('-s', '--step', type=int, default=None, help='Step to load')
     parser.add_argument('-x', '--max-problems', type=int, default=None, help='Max problems to evaluate')
-    parser.add_argument('--device-type', type=str, default='', choices=['cuda', 'cpu', 'mps', 'tpu'], help='Device type for evaluation: cuda|cpu|mps|tpu. empty => autodetect')
+    parser.add_argument('--device-type', type=str, default='', choices=['tpu', 'cpu'], help='Device type for evaluation: tpu|cpu. empty => autodetect')
     args = parser.parse_args()
 
     device_type = autodetect_device_type() if args.device_type == "" else args.device_type

@@ -91,7 +91,7 @@ def _allocate_token_buffers(B, T, device, pin_memory):
 def tokenizing_distributed_data_loader_with_state_bos_bestfit(
     tokenizer, B, T, split,
     tokenizer_threads=4, tokenizer_batch_size=128,
-    device="cuda", resume_state_dict=None,
+    device="tpu", resume_state_dict=None,
     buffer_size=1000
 ):
     """
@@ -125,19 +125,18 @@ def tokenizing_distributed_data_loader_with_state_bos_bestfit(
         for tokens in token_lists:
             doc_buffer.append(tokens)
 
-    # Pre-allocate double-buffered staging and device buffers once (see _allocate_token_buffers).
-    # Double-buffering avoids overwriting the previous micro-step's device tensors
-    # while its backward pass is still in flight on the accelerator.
-    # Compare on device.type so cuda:0 and tpu both pin the staging buffer.
+    # Pre-allocate 4-slot ring-buffered staging and device buffers once (see _allocate_token_buffers).
+    # Ring-buffering allows up to 4 micro-steps to be pipelined on the TPU without overwriting
+    # in-flight input/target tensors.
     device_type = device.type if isinstance(device, torch.device) else str(device).split(":")[0]
-    use_accel = device_type in ("cuda", "tpu")
+    use_accel = device_type == "tpu"
     row_buffer = torch.empty((B, row_capacity), dtype=torch.long) # for building rows without creating Python lists
-    buffer_sets = [_allocate_token_buffers(B, T, device, pin_memory=use_accel) for _ in range(2)]
+    buffer_sets = [_allocate_token_buffers(B, T, device, pin_memory=use_accel) for _ in range(4)]
     buf_idx = 0
 
     while True:
         cpu_inputs, cpu_targets, inputs, targets = buffer_sets[buf_idx]
-        buf_idx ^= 1
+        buf_idx = (buf_idx + 1) & 3
         for row_idx in range(B):
             pos = 0
             while pos < row_capacity:
