@@ -14,10 +14,14 @@ traces the JAX functions once per shape and dtype, exports a StableHLO
 module, and after that the kernel runs on ``torch.Tensor`` TPU buffers.
 No JAX runtime executes during training or inference.
 
-q, k, v are ``(batch, heads, seq, dim)``, matching PyTorch SDPA. Causal masks
-are bottom-right aligned, so a short query against a longer KV cache (prefill
-already consumed) lines up with Flash Attention. Sequence lengths must be
-multiples of 128; token-by-token decode is not a legal Splash tile.
+q, k, v are ``(batch, heads, seq, dim)``, matching PyTorch SDPA. The kernel
+grids over heads, so the JAX functions fold batch into heads with a reshape.
+That reshape stays inside the StableHLO module: the PyTorch op is called on the
+original ``(batch, heads, seq, dim)`` tensors, which lets AOTAutograd deduplicate
+them with the QK-norm outputs. Causal masks are bottom-right aligned, so a short
+query against a longer KV cache (prefill already consumed) lines up with Flash
+Attention. Sequence lengths must be multiples of 128; token-by-token decode is
+not a legal Splash tile.
 """
 
 import hashlib
@@ -111,6 +115,7 @@ def _make_splash_attention_fn(
     kv_seq_len: int,
     n_heads: int,
     n_kv_heads: int,
+    batch: int = 1,
     scale: float | None = None,
     is_causal: bool = True,
     local_window_size: int | None = None,
@@ -130,11 +135,15 @@ def _make_splash_attention_fn(
 ):
     """Build JAX Splash forward and backward callables for one static shape.
 
-    Forward takes ``(q, k, v)`` and returns ``(out, logsumexp)``. Backward takes
-    ``(q, k, v, out, logsumexp, grad_out)`` and returns ``(dq, dk, dv)`` from the
-    saved residuals, without re-running the forward kernel.
+    Forward takes ``(q, k, v)`` shaped ``(batch, heads, seq, dim)`` and returns
+    ``(out, logsumexp)`` in that same layout. Backward takes those saved tensors
+    plus ``grad_out`` and returns ``(dq, dk, dv)``. The batch axis is folded into
+    heads inside these functions so the Pallas grid is ``(batch * heads, ...)``.
     """
     jax, jnp, splash_attention_kernel, splash_attention_mask, QKVLayout = _ensure_kernel_modules()
+    batch = max(int(batch), 1)
+    kernel_q_heads = batch * n_heads
+    kernel_kv_heads = batch * n_kv_heads
     default_mask_value = splash_attention_kernel.DEFAULT_MASK_VALUE
 
     def _get_layout(layout_str):
@@ -183,8 +192,8 @@ def _make_splash_attention_fn(
     else:
         single_mask = splash_attention_mask.FullMask(mask_shape)
 
-    multi_head_mask = splash_attention_mask.MultiHeadMask(masks=(single_mask,) * n_heads)
-    is_mqa = n_kv_heads == 1
+    multi_head_mask = splash_attention_mask.MultiHeadMask(masks=(single_mask,) * kernel_q_heads)
+    is_mqa = kernel_kv_heads == 1
     if is_mqa:
         splash_kernel = splash_attention_kernel.make_splash_mqa(
             mask=multi_head_mask,
@@ -228,12 +237,30 @@ def _make_splash_attention_fn(
         )
         return out_b, logsumexp_b
 
+    def _fold_qkv(q, k, v):
+        """(batch, heads, seq, dim) -> one batch row whose head count is batch * heads."""
+        b, h, t, d = q.shape
+        kv_h = k.shape[1]
+        q_f = jnp.reshape(q, (1, b * h, t, d))
+        k_f = jnp.reshape(k, (1, b * kv_h, k.shape[2], k.shape[3]))
+        v_f = jnp.reshape(v, (1, b * kv_h, v.shape[2], v.shape[3]))
+        if is_mqa:
+            k_f = jnp.squeeze(k_f, axis=1)
+            v_f = jnp.squeeze(v_f, axis=1)
+        return q_f, k_f, v_f
+
     # jax.Array annotations are how jax_op builds the PyTorch custom-op schema.
+    # Shapes here are the PyTorch tensors. The fold is a bitcast in the HLO module,
+    # not a second saved activation at the autograd boundary.
     def splash_fn(q: jax.Array, k: jax.Array, v: jax.Array) -> tuple[jax.Array, jax.Array]:
+        b, h, t, d = q.shape
+        q_f, k_f, v_f = _fold_qkv(q, k, v)
         head_dim = q.shape[-1]
         scale_val = (1.0 / math.sqrt(head_dim)) if scale is None else float(scale)
         scale_arr = jnp.array(scale_val, dtype=q.dtype)
-        out, logsumexp = jax.vmap(_single_fwd_with_lse)(q * scale_arr, k, v)
+        out, logsumexp = jax.vmap(_single_fwd_with_lse)(q_f * scale_arr, k_f, v_f)
+        out = jnp.reshape(out, (b, h, t, d))
+        logsumexp = jnp.reshape(logsumexp, (b, h, t))
         return out, logsumexp
 
     def _single_bwd(q_scaled_b, k_b, v_b, out_b, logsumexp_b, g_b):
@@ -274,20 +301,29 @@ def _make_splash_attention_fn(
         logsumexp: jax.Array,
         g: jax.Array,
     ) -> tuple[jax.Array, jax.Array, jax.Array]:
+        b, h, t, d = q.shape
+        kv_h = k.shape[1]
+        kv_t = k.shape[2]
+        q_f, k_f, v_f = _fold_qkv(q, k, v)
+        out_f = jnp.reshape(out, (1, b * h, t, d))
+        lse_f = jnp.reshape(logsumexp, (1, b * h, t))
+        g_f = jnp.reshape(g, (1, b * h, t, d))
         head_dim = q.shape[-1]
         scale_val = (1.0 / math.sqrt(head_dim)) if scale is None else float(scale)
         scale_arr = jnp.array(scale_val, dtype=q.dtype)
-        q_scaled = q * scale_arr
+        q_scaled = q_f * scale_arr
         if use_vmap_bwd:
-            dq_scaled, dk, dv = jax.vmap(_single_bwd)(q_scaled, k, v, out, logsumexp, g)
+            dq_scaled, dk, dv = jax.vmap(_single_bwd)(q_scaled, k_f, v_f, out_f, lse_f, g_f)
         else:
             _, (dq_scaled, dk, dv) = jax.lax.scan(
-                _scan_bwd_body, None, (q_scaled, k, v, out, logsumexp, g),
+                _scan_bwd_body, None, (q_scaled, k_f, v_f, out_f, lse_f, g_f),
             )
-        dq = dq_scaled * scale_arr
-        dq = jax.lax.optimization_barrier(dq)
+        dq = jax.lax.optimization_barrier(dq_scaled * scale_arr)
         dk = jax.lax.optimization_barrier(dk)
         dv = jax.lax.optimization_barrier(dv)
+        dq = jnp.reshape(dq, (b, h, t, d))
+        dk = jnp.reshape(dk, (b, kv_h, kv_t, d))
+        dv = jnp.reshape(dv, (b, kv_h, kv_t, d))
         return dq, dk, dv
 
     return splash_fn, splash_bwd_fn
@@ -363,9 +399,9 @@ def splash_sdpa(
 ) -> torch.Tensor:
     """Splash Attention with the ``F.scaled_dot_product_attention`` argument layout.
 
-    q, k, v are ``(batch, heads, seq, dim)`` on TPU. Grouped-query attention is
-    native (the kernel groups query heads onto KV heads). Multi-query attention
-    (a single KV head) squeezes that head dimension, which is what Splash expects.
+    q, k, v are ``(batch, heads, seq, dim)`` on TPU. The op is invoked on those
+    tensors unchanged. Grouped-query attention is native. A single KV head is
+    squeezed inside the JAX function, which is what the MQA kernel expects.
     """
     block_q = int(os.environ.get("SPLASH_BLOCK_Q", block_q))
     block_kv = int(os.environ.get("SPLASH_BLOCK_KV", block_kv))
@@ -380,7 +416,9 @@ def splash_sdpa(
     if vmap_env is not None:
         use_vmap_bwd = vmap_env.strip().lower() not in ("0", "false", "no")
 
-    _batch, n_heads, q_seq_len, head_dim = q.shape
+    # Folding happens in splash_fn / splash_bwd_fn. Reshaping here would make
+    # the saved q, k a different FX node from the QK-norm outputs.
+    batch, n_heads, q_seq_len, _head_dim = q.shape
     n_kv_heads = k.shape[1]
     kv_seq_len = k.shape[2]
     if enable_gqa != (n_heads != n_kv_heads):
@@ -415,6 +453,7 @@ def splash_sdpa(
         kv_seq_len=kv_seq_len,
         n_heads=n_heads,
         n_kv_heads=n_kv_heads,
+        batch=batch,
         scale=scale,
         is_causal=is_causal,
         local_window_size=local_window_size,
@@ -435,9 +474,6 @@ def splash_sdpa(
     torch_fwd_fn = getattr(_splash_ops, _get_splash_op(**splash_args))
 
     input_dtype = q.dtype
-    if n_kv_heads == 1:
-        k = torch.squeeze(k, dim=1)
-        v = torch.squeeze(v, dim=1)
     result, _lse = torch_fwd_fn(q, k, v)
     result = typing.cast(torch.Tensor, result)
     if result.dtype != input_dtype:

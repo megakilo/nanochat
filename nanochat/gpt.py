@@ -12,6 +12,7 @@ Notable features:
 - TPU Splash Attention integration
 """
 
+import os
 from dataclasses import dataclass
 
 import torch
@@ -22,6 +23,12 @@ from torch.utils.checkpoint import checkpoint
 from nanochat.common import print0, COMPUTE_DTYPE
 from nanochat.optim import MuonAdamW
 from nanochat.flash_attention import flash_attn
+
+# Saved q, k, v, and attention output above this recompute the whole block.
+# 4.5 GiB is exactly d24 at B=8, T=2048 (and d12 at B=32). That footprint fits
+# in 32GB next to fp32 weights, Adam moments, and gradients for one in-flight
+# microbatch. d28 at the same token count is larger and recomputes.
+SELECTIVE_CHECKPOINT_MAX_ATTN_BYTES = (9 << 30) // 2
 
 @dataclass
 class GPTConfig:
@@ -120,15 +127,93 @@ def has_ve(layer_idx, n_layer):
     """Returns True if GPT layer should have Value Embedding (alternating, last layer always included)."""
     return layer_idx % 2 == (n_layer - 1) % 2
 
+class _RotaryFn(torch.autograd.Function):
+    """Rotary embedding whose backward does not keep the query or key.
+
+    The map is linear, so the backward only needs ``cos`` and ``sin``. Eager
+    split/mul/cat would retain the projection output (and the half-size products).
+    Rotates by -theta, the transpose of the textbook convention, so old
+    checkpoints stay valid.
+    """
+
+    @staticmethod
+    def forward(ctx, x, cos, sin):
+        d = x.shape[-1] // 2
+        x1, x2 = x[..., :d], x[..., d:]
+        y1 = x1 * cos + x2 * sin
+        y2 = x2 * cos - x1 * sin
+        ctx.save_for_backward(cos, sin)
+        return torch.cat([y1, y2], dim=-1)
+
+    @staticmethod
+    def backward(ctx, grad_out):
+        cos, sin = ctx.saved_tensors
+        d = grad_out.shape[-1] // 2
+        g1, g2 = grad_out[..., :d], grad_out[..., d:]
+        # y1 = x1 cos + x2 sin, y2 = -x1 sin + x2 cos
+        dx1 = g1 * cos - g2 * sin
+        dx2 = g1 * sin + g2 * cos
+        return torch.cat([dx1, dx2], dim=-1), None, None
+
+
 def apply_rotary_emb(x, cos, sin):
     # note: this rotates by -theta, the transpose of the textbook convention. Functionally
     # equivalent (only the relative q/k rotation matters), kept for checkpoint compatibility.
     assert x.ndim == 4  # multihead attention
-    d = x.shape[3] // 2
-    x1, x2 = x[..., :d], x[..., d:] # split up last dim into two halves
-    y1 = x1 * cos + x2 * sin # rotate pairs of dims
-    y2 = x1 * (-sin) + x2 * cos
-    return torch.cat([y1, y2], 3)
+    return _RotaryFn.apply(x, cos, sin)
+
+
+def full_block_checkpoint(grad_checkpoint, config, batch: int, seq_len: int) -> bool:
+    """Whether to recompute the whole block in backward (Splash forward included).
+
+    ``grad_checkpoint="full"`` or ``NANOCHAT_FULL_CHECKPOINT=1`` always does.
+    Otherwise the decision is the bytes of q, k, v, and the attention output,
+    so a wide shallow model and a narrow deep one with the same token count
+    do not share a checkpoint mode.
+    """
+    if not grad_checkpoint:
+        return False
+    forced = os.environ.get("NANOCHAT_FULL_CHECKPOINT", "").strip().lower()
+    if grad_checkpoint == "full" or forced in ("1", "true", "yes"):
+        return True
+    attn_bytes = attention_activation_bytes(
+        config.n_layer, config.n_head, config.n_kv_head,
+        config.n_embd // config.n_head, batch, seq_len,
+    )
+    return attn_bytes > SELECTIVE_CHECKPOINT_MAX_ATTN_BYTES
+
+
+def attention_activation_bytes(n_layer, n_head, n_kv_head, head_dim, batch, seq_len) -> int:
+    """Bytes of q, k, v, and attention output saved when Splash is not recomputed."""
+    elem = COMPUTE_DTYPE.itemsize
+    per_token_head = seq_len * head_dim * elem
+    heads = 2 * n_head + 2 * n_kv_head  # q, out, k, v
+    return n_layer * batch * heads * per_token_head
+
+
+def tpu_microbatch_sync_every(config, batch: int, seq_len: int, grad_checkpoint) -> int:
+    """Device sync stride for a 32GB TPU. Never larger than the dataloader ring (4).
+
+    Full-block checkpointing only keeps the residual, so four queued microbatches
+    fit and hide host launch latency. MLP-only checkpointing also keeps Splash
+    q/k/v/out. Queue fewer of those so the backward program stays inside HBM.
+    """
+    if not grad_checkpoint:
+        return 1
+    if full_block_checkpoint(grad_checkpoint, config, batch, seq_len):
+        return 4
+    attn_bytes = attention_activation_bytes(
+        config.n_layer, config.n_head, config.n_kv_head,
+        config.n_embd // config.n_head, batch, seq_len,
+    )
+    # Queued attention-save budget. Weights, optimizer state, and gradients
+    # already occupy most of a 32GB chip at d24.
+    budget = 6 << 30
+    if attn_bytes <= budget // 4:
+        return 4
+    if attn_bytes <= budget // 2:
+        return 2
+    return 1
 
 class CausalSelfAttention(nn.Module):
     def __init__(self, config, layer_idx):
@@ -291,10 +376,10 @@ class Block(nn.Module):
     def forward_checkpointed(self, x, x0, resid_lambda, x0_lambda, idx, ve_embed, cos_sin, window_size, full_recompute=False):
         """Activation-checkpointed block forward for training.
 
-        When ``full_recompute=False`` (default for B*T <= 8192), checkpoints the MLP
-        via ``_FusedNormMLP`` while keeping attention activations in memory — eliminating
-        all Splash Attention forward recomputations and ``tpu._optimization_barrier`` ops.
-        When ``full_recompute=True``, checkpoints the entire block so only ``x`` is saved.
+        When ``full_recompute=False``, checkpoints the MLP via ``_FusedNormMLP`` while
+        keeping attention activations in memory — no Splash forward recompute and no
+        ``tpu._optimization_barrier``. When ``full_recompute=True``, checkpoints the
+        entire block so only ``x`` is saved.
         """
         if not full_recompute:
             x_s = resid_lambda * x + x0_lambda * x0
@@ -307,6 +392,17 @@ class Block(nn.Module):
             return self.forward(x_s, ve, cos_sin, window_size, None, recompute_mlp=True)
 
         return checkpoint(_block, x, x0, resid_lambda, x0_lambda, idx, use_reentrant=False)
+
+
+def _token_matrices(x, targets):
+    """Flatten a token batch without the caller creating a second FX node.
+
+    ``x`` may be ``(B, T, D)`` (the final norm output) or already ``(N, D)``.
+    Viewing outside the autograd Function makes AOTAutograd save both layouts.
+    """
+    x_2d = x.reshape(-1, x.shape[-1])
+    targets_1d = targets.reshape(-1)
+    return x_2d, targets_1d
 
 
 def _linear_softcap_cross_entropy_fwd(x_2d, weight, targets_1d, vocab_size, softcap, reduction):
@@ -331,13 +427,20 @@ def _linear_softcap_cross_entropy_fwd(x_2d, weight, targets_1d, vocab_size, soft
 
 
 def _linear_softcap_cross_entropy_bwd_chunk(x_c, w_t, t_c, vocab_arange, softcap, scale_c):
+    """Softcap cross-entropy backward for one token chunk.
+
+    ``dlogits = (probs - one_hot) * sech^2 * scale``. The target pick is a
+    ``where`` so XLA lowers it to iota/compare/select and fuses it with the
+    softmax and the bf16 cast. A scatter is a fusion barrier and would write
+    the fp32 logit gradient to HBM. Invalid rows carry scale 0.
+    """
     logits_raw = (x_c @ w_t).float()
     t = torch.tanh(logits_raw / softcap)
     probs = F.softmax(softcap * t, dim=-1)
-    valid_mask = t_c != -1
-    safe_targets = torch.where(valid_mask, t_c, torch.zeros_like(t_c))
-    one_hot = (safe_targets.unsqueeze(1) == vocab_arange).to(torch.float32)
-    dlogits = (probs - one_hot) * (1.0 - t * t) * scale_c.unsqueeze(1)
+    sech2 = 1.0 - t * t
+    safe_targets = torch.where(t_c != -1, t_c, torch.zeros_like(t_c))
+    dlogits = torch.where(safe_targets.unsqueeze(1) == vocab_arange, probs - 1.0, probs)
+    dlogits = dlogits * sech2 * scale_c.unsqueeze(1)
     dlogits_bf16 = dlogits.to(dtype=x_c.dtype)
     grad_x_c = dlogits_bf16 @ w_t.t()
     grad_w_c = (dlogits_bf16.t() @ x_c).to(dtype=torch.float32)
@@ -347,25 +450,29 @@ def _linear_softcap_cross_entropy_bwd_chunk(x_c, w_t, t_c, vocab_arange, softcap
 class _LinearSoftcapCrossEntropy(torch.autograd.Function):
     """Fused linear + logit softcap + cross-entropy loss with memory-efficient backward.
 
-    Saves only ``x_2d`` (B*T, D), ``weight``, and ``targets_1d`` (B*T,) from forward
-    to backward instead of ``(B*T, vocab_size)`` fp32 logits, and computes ``grad_x``
-    and ``grad_weight`` without activation-checkpoint optimization barriers.
+    Saves ``x`` in the layout it was passed (``(B, T, D)`` from the final norm),
+    ``weight``, and ``targets``. The token flatten happens inside the function so
+    it is not a second saved output. Logits are not saved.
     """
 
     @staticmethod
-    def forward(ctx, x_2d, weight, targets_1d, vocab_size: int, softcap: float, reduction: str):
-        ctx.save_for_backward(x_2d, weight, targets_1d)
+    def forward(ctx, x, weight, targets, vocab_size: int, softcap: float, reduction: str):
+        # Save ``x`` itself (B, T, D), not a flattened view, so it aliases the
+        # final norm output across the forward/backward boundary.
+        ctx.save_for_backward(x, weight, targets)
         ctx.vocab_size = vocab_size
         ctx.softcap = float(softcap)
         ctx.reduction = reduction
+        x_2d, targets_1d = _token_matrices(x, targets)
         return _linear_softcap_cross_entropy_fwd(x_2d, weight, targets_1d, vocab_size, softcap, reduction)
 
     @staticmethod
     def backward(ctx, grad_out):
-        x_2d, weight, targets_1d = ctx.saved_tensors
+        x, weight, targets = ctx.saved_tensors
         vocab_size = ctx.vocab_size
         softcap = ctx.softcap
         reduction = ctx.reduction
+        x_2d, targets_1d = _token_matrices(x, targets)
 
         w_slice = weight[:vocab_size] if vocab_size < weight.size(0) else weight
         w_t = w_slice.t().to(dtype=x_2d.dtype)
@@ -378,7 +485,7 @@ class _LinearSoftcapCrossEntropy(torch.autograd.Function):
         else:
             scale = grad_out.float().view(-1) * valid_f
 
-        vocab_arange = torch.arange(vocab_size, device=targets_1d.device).unsqueeze(0)
+        vocab_arange = torch.arange(vocab_size, device=targets.device)
         num_chunks = max(1, x_2d.size(0) // 8192)
         if num_chunks <= 1:
             grad_x, grad_w_f32 = _linear_softcap_cross_entropy_bwd_chunk(
@@ -401,7 +508,7 @@ class _LinearSoftcapCrossEntropy(torch.autograd.Function):
             grad_w[:vocab_size] = grad_w_valid
         else:
             grad_w = grad_w_valid
-        return grad_x, grad_w, None, None, None, None
+        return grad_x.view(x.shape), grad_w, None, None, None, None
 
 
 class GPT(nn.Module):
@@ -747,7 +854,7 @@ class GPT(nn.Module):
         backout_layer = n_layer // 2  # cache at halfway point
         x_backout = None
         use_ckpt = bool(self.grad_checkpoint) and self.training and kv_cache is None and torch.is_grad_enabled()
-        full_recompute = (self.grad_checkpoint == "full") or (B * T > 8192)
+        full_recompute = use_ckpt and full_block_checkpoint(self.grad_checkpoint, self.config, B, T)
         for i, block in enumerate(self.transformer.h):
             ve_embed = self.value_embeds[str(i)] if str(i) in self.value_embeds else None
             if use_ckpt:
@@ -773,16 +880,15 @@ class GPT(nn.Module):
             # training / eval loss: use custom autograd Function when grad is enabled so
             # full (B, T, vocab_size) fp32 logits + softcap tensors are never saved across
             # forward to backward, and backward runs without activation-checkpoint barriers.
-            x_flat = x.view(-1, x.size(-1))
-            t_flat = targets.view(-1)
             if torch.is_grad_enabled():
                 loss = _LinearSoftcapCrossEntropy.apply(
-                    x_flat, self.lm_head.weight, t_flat,
+                    x, self.lm_head.weight, targets,
                     self.config.vocab_size, softcap, loss_reduction,
                 )
             else:
+                x_2d, t_1d = _token_matrices(x, targets)
                 loss = _linear_softcap_cross_entropy_fwd(
-                    x_flat, self.lm_head.weight, t_flat,
+                    x_2d, self.lm_head.weight, t_1d,
                     self.config.vocab_size, softcap, loss_reduction,
                 )
             if loss_scale is not None:

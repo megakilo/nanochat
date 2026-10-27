@@ -17,6 +17,7 @@ import time
 import wandb
 import torch
 from nanochat.common import compute_init, compute_cleanup, print0, DummyWandb, get_base_dir, autodetect_device_type, get_peak_flops, get_device_name, compile_model, device_synchronize, device_peak_memory, COMPUTE_DTYPE, COMPUTE_DTYPE_REASON, is_ddp_initialized
+from nanochat.gpt import full_block_checkpoint, attention_activation_bytes, tpu_microbatch_sync_every
 from nanochat.tokenizer import get_token_bytes
 from nanochat.checkpoint_manager import save_checkpoint, load_model, load_optimizer_state
 from nanochat.loss_eval import evaluate_bpb
@@ -124,7 +125,7 @@ grad_checkpoint = (device_type == "tpu") if args.grad_checkpoint is None else ar
 user_config["grad_checkpoint"] = grad_checkpoint
 model.grad_checkpoint = grad_checkpoint
 if grad_checkpoint:
-    print0("✓ Activation checkpointing enabled (split-attention)")
+    print0("✓ Activation checkpointing enabled")
 orig_model = model
 model = compile_model(model, dynamic=False)
 depth = model.config.n_layer
@@ -136,6 +137,20 @@ grad_accum_steps = args.total_batch_size // world_tokens_per_fwdbwd
 print0(f"Tokens / micro-batch / rank: {args.device_batch_size} x {args.max_seq_len} = {tokens_per_fwdbwd:,}")
 print0(f"Tokens / micro-batch: {world_tokens_per_fwdbwd:,}")
 print0(f"Total batch size {args.total_batch_size:,} => gradient accumulation steps: {grad_accum_steps}")
+sync_every = 0
+if device_type == "tpu":
+    sync_every = tpu_microbatch_sync_every(model.config, args.device_batch_size, args.max_seq_len, grad_checkpoint)
+    if not grad_checkpoint:
+        ckpt_name = "off"
+    elif full_block_checkpoint(grad_checkpoint, model.config, args.device_batch_size, args.max_seq_len):
+        ckpt_name = "full block (Splash recomputed)"
+    else:
+        attn_mib = attention_activation_bytes(
+            model.config.n_layer, model.config.n_head, model.config.n_kv_head,
+            model.config.n_embd // model.config.n_head, args.device_batch_size, args.max_seq_len,
+        ) / (1024 * 1024)
+        ckpt_name = f"MLP-only, attention kept ({attn_mib:.0f} MiB)"
+    print0(f"TPU schedule: {ckpt_name} | device sync every {sync_every} microbatch(es)")
 token_bytes = get_token_bytes(device=device)
 
 # Initialize the Optimizer (combined MuonAdamW: Muon for matrix params, AdamW for rest)
@@ -434,9 +449,11 @@ while True:
         if micro_step == grad_accum_steps - 1:
             train_loss = loss.detach() # for logging
         loss.backward()
-        if device_type == "tpu" and ((micro_step + 1) % 4 == 0 or micro_step == grad_accum_steps - 1):
+        # SFT builds a fresh batch per yield, so packing and HtoD can start
+        # before the sync that waits for this backward.
+        x, y = next(train_loader)
+        if sync_every and ((micro_step + 1) % sync_every == 0 or micro_step == grad_accum_steps - 1):
             synchronize()
-        x, y = next(train_loader) # prefetch the next batch while the TPU is busy with forward/backward
         progress = max(progress, approx_progress) # only increase progress monotonically
     # step the optimizer
     lrm = get_lr_multiplier(progress)

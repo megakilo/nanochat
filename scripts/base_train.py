@@ -22,7 +22,7 @@ from dataclasses import asdict
 import wandb
 import torch
 
-from nanochat.gpt import GPT, GPTConfig
+from nanochat.gpt import GPT, GPTConfig, full_block_checkpoint, attention_activation_bytes, tpu_microbatch_sync_every
 from nanochat.dataloader import tokenizing_distributed_data_loader_bos_bestfit, tokenizing_distributed_data_loader_with_state_bos_bestfit
 from nanochat.common import compute_init, compute_cleanup, print0, DummyWandb, print_banner, get_base_dir, autodetect_device_type, get_peak_flops, get_device_name, compile_model, device_synchronize, device_peak_memory, COMPUTE_DTYPE, COMPUTE_DTYPE_REASON
 from nanochat.tokenizer import get_tokenizer, get_token_bytes
@@ -235,7 +235,7 @@ if resuming:
 # -----------------------------------------------------------------------------
 # Initialize the DataLoaders for train/val
 dataloader_resume_state_dict = None if not resuming else meta_data["dataloader_state_dict"]
-train_loader = tokenizing_distributed_data_loader_with_state_bos_bestfit(tokenizer, args.device_batch_size, args.max_seq_len, split="train", device=device, resume_state_dict=dataloader_resume_state_dict)
+train_loader = tokenizing_distributed_data_loader_with_state_bos_bestfit(tokenizer, args.device_batch_size, args.max_seq_len, split="train", device=device, resume_state_dict=dataloader_resume_state_dict, prefetch=True)
 build_val_loader = lambda: tokenizing_distributed_data_loader_bos_bestfit(tokenizer, args.device_batch_size, args.max_seq_len, split="val", device=device)
 x, y, dataloader_state_dict = next(train_loader) # kick off load of the very first batch of data
 
@@ -318,6 +318,20 @@ grad_accum_steps = total_batch_size // world_tokens_per_fwdbwd
 print0(f"Tokens / micro-batch / rank: {args.device_batch_size} x {args.max_seq_len} = {tokens_per_fwdbwd:,}")
 print0(f"Tokens / micro-batch: {world_tokens_per_fwdbwd:,}")
 print0(f"Total batch size {total_batch_size:,} => gradient accumulation steps: {grad_accum_steps}")
+sync_every = 0
+if device_type == "tpu":
+    sync_every = tpu_microbatch_sync_every(model_config, args.device_batch_size, args.max_seq_len, grad_checkpoint)
+    if not grad_checkpoint:
+        ckpt_name = "off"
+    elif full_block_checkpoint(grad_checkpoint, model_config, args.device_batch_size, args.max_seq_len):
+        ckpt_name = "full block (Splash recomputed)"
+    else:
+        attn_mib = attention_activation_bytes(
+            model_config.n_layer, model_config.n_head, model_config.n_kv_head,
+            model_config.n_embd // model_config.n_head, args.device_batch_size, args.max_seq_len,
+        ) / (1024 * 1024)
+        ckpt_name = f"MLP-only, attention kept ({attn_mib:.0f} MiB)"
+    print0(f"TPU schedule: {ckpt_name} | device sync every {sync_every} microbatch(es)")
 
 # Go!
 while True:
@@ -416,9 +430,15 @@ while True:
         if micro_step == grad_accum_steps - 1:
             train_loss = loss.detach() # for logging
         loss.backward()
-        if device_type == "tpu" and ((micro_step + 1) % 4 == 0 or micro_step == grad_accum_steps - 1):
+        # Copy the next microbatch into a free ring slot while this backward is
+        # still running. A stride of 4 fills the ring, so that boundary syncs
+        # first and the slot about to be reused is idle.
+        need_sync = bool(sync_every) and ((micro_step + 1) % sync_every == 0 or micro_step == grad_accum_steps - 1)
+        if need_sync and sync_every >= 4:
             synchronize()
-        x, y, dataloader_state_dict = next(train_loader) # prefetch the next batch while the TPU is busy with forward/backward
+        x, y, dataloader_state_dict = next(train_loader)
+        if need_sync and sync_every < 4:
+            synchronize()
     # step the optimizer
     lrm = get_lr_multiplier(step)
     muon_momentum = get_muon_momentum(step)

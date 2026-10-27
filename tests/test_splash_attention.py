@@ -94,6 +94,124 @@ def test_compile_model_leaves_cpu_backend_default(monkeypatch):
     assert captured == {"dynamic": False}
 
 
+def test_checkpoint_policy_fits_v6e_d24():
+    """Checkpoint mode follows saved attention bytes, not token count."""
+    from nanochat.gpt import GPTConfig, attention_activation_bytes, full_block_checkpoint, tpu_microbatch_sync_every
+
+    d24 = GPTConfig(sequence_len=2048, n_layer=24, n_head=12, n_kv_head=12, n_embd=1536)
+    d12 = GPTConfig(sequence_len=2048, n_layer=12, n_head=6, n_kv_head=6, n_embd=768)
+    d28 = GPTConfig(sequence_len=2048, n_layer=28, n_head=14, n_kv_head=14, n_embd=1792)
+    # d24 B=8 is the 4.5 GiB boundary and stays selective. d24 B=16 and d28 B=8 recompute.
+    assert full_block_checkpoint(True, d24, 8, 2048) is False
+    assert full_block_checkpoint(True, d24, 16, 2048) is True
+    assert full_block_checkpoint(True, d28, 8, 2048) is True
+    # Same token counts that used to force a recompute on d12 now stay selective.
+    assert full_block_checkpoint(True, d12, 16, 2048) is False
+    assert full_block_checkpoint(True, d12, 32, 2048) is False
+    assert full_block_checkpoint("full", d12, 1, 128) is True
+    assert full_block_checkpoint(False, d24, 32, 2048) is False
+    assert tpu_microbatch_sync_every(d24, 8, 2048, True) == 1
+    assert tpu_microbatch_sync_every(d24, 4, 2048, True) == 2
+    assert tpu_microbatch_sync_every(d12, 4, 2048, True) == 4
+    assert tpu_microbatch_sync_every(d12, 32, 2048, True) == 1
+    assert tpu_microbatch_sync_every(d24, 8, 2048, "full") == 4
+    attn = attention_activation_bytes(24, 12, 12, 128, 8, 2048)
+    assert attn == (9 << 30) // 2
+
+
+def test_full_checkpoint_env_override(monkeypatch):
+    from nanochat.gpt import GPTConfig, full_block_checkpoint
+    cfg = GPTConfig()
+    monkeypatch.setenv("NANOCHAT_FULL_CHECKPOINT", "1")
+    assert full_block_checkpoint(True, cfg, 1, 128) is True
+    assert full_block_checkpoint(False, cfg, 1, 128) is False
+
+
+def test_loss_keeps_token_layout():
+    """Flattening inside the loss must match an explicit flatten, including grads."""
+    from nanochat.gpt import _LinearSoftcapCrossEntropy
+    torch.manual_seed(0)
+    x3 = torch.randn(4, 8, 16, dtype=torch.float32, requires_grad=True)
+    w = torch.randn(32, 16, requires_grad=True)
+    targets = torch.randint(0, 20, (4, 8))
+    targets[0, 1] = -1
+    y3 = _LinearSoftcapCrossEntropy.apply(x3, w, targets, 20, 15.0, "mean")
+    x2 = x3.detach().reshape(-1, 16).requires_grad_(True)
+    w2 = w.detach().clone().requires_grad_(True)
+    y2 = _LinearSoftcapCrossEntropy.apply(x2, w2, targets.reshape(-1), 20, 15.0, "mean")
+    torch.testing.assert_close(y3, y2)
+    y3.backward()
+    y2.backward()
+    torch.testing.assert_close(x3.grad, x2.grad.view_as(x3))
+    torch.testing.assert_close(w.grad, w2.grad)
+
+
+def test_rotary_grad_matches_explicit():
+    from nanochat.gpt import apply_rotary_emb
+    torch.manual_seed(0)
+    x = torch.randn(2, 16, 4, 32, requires_grad=True)
+    cos = torch.randn(1, 16, 1, 16)
+    sin = torch.randn(1, 16, 1, 16)
+    y = apply_rotary_emb(x, cos, sin)
+    d = 16
+    x1, x2 = x[..., :d], x[..., d:]
+    y_ref = torch.cat([x1 * cos + x2 * sin, x1 * (-sin) + x2 * cos], dim=-1)
+    torch.testing.assert_close(y, y_ref)
+    grad = torch.randn_like(y)
+    y.backward(grad)
+    grad_x = x.grad
+    x2p = x.detach().requires_grad_(True)
+    x1, x2s = x2p[..., :d], x2p[..., d:]
+    y2 = torch.cat([x1 * cos + x2s * sin, x1 * (-sin) + x2s * cos], dim=-1)
+    y2.backward(grad)
+    torch.testing.assert_close(grad_x, x2p.grad)
+
+
+def test_bestfit_matches_linear_scan():
+    import random
+    from nanochat.dataloader import _BestFitDocs
+
+    rng = random.Random(0)
+    docs = [torch.arange(rng.randint(1, 40)) for _ in range(200)]
+    buf = _BestFitDocs()
+    ref = []
+    for doc in docs:
+        buf.append(doc.clone())
+        ref.append(doc.clone())
+    remainings = [rng.randint(1, 40) for _ in range(80)]
+    for remaining in remainings:
+        best_i, best_len = -1, 0
+        for i, doc in enumerate(ref):
+            n = doc.numel()
+            if n <= remaining and n > best_len:
+                best_i, best_len = i, n
+        if best_i >= 0:
+            expect = ref.pop(best_i)
+            got = buf.pop_best_fit(remaining)
+        else:
+            shortest_i = min(range(len(ref)), key=lambda i: ref[i].numel())
+            expect = ref.pop(shortest_i)
+            assert buf.pop_best_fit(remaining) is None
+            got = buf.pop_shortest()
+        assert torch.equal(got, expect)
+    assert buf.n == len(ref)
+
+
+def test_prefetch_iterator_preserves_order_and_errors():
+    from nanochat.dataloader import _prefetch_iterator
+    assert list(_prefetch_iterator(iter([1, 2, 3, 4]), depth=2)) == [1, 2, 3, 4]
+
+    def _boom():
+        yield 1
+        raise RuntimeError("pack failed")
+
+    got = []
+    with pytest.raises(RuntimeError, match="pack failed"):
+        for item in _prefetch_iterator(_boom(), depth=2):
+            got.append(item)
+    assert got == [1]
+
+
 def test_dataloader_device_buffers_own_storage():
     from nanochat.dataloader import _allocate_token_buffers
 
@@ -110,6 +228,78 @@ def test_dataloader_device_buffers_own_storage():
         assert t.dtype == torch.long
         assert t.storage_offset() == 0
         assert t.untyped_storage().size() == B * T * t.element_size()
+
+
+def _install_fake_splash(monkeypatch):
+    """Replace the JAX bridge so Splash tests can run without a TPU."""
+    import types
+    import nanochat.splash_attention as sa
+
+    seen = []
+
+    def fake_make_splash(**kwargs):
+        seen.append(kwargs)
+
+        def fwd(q, k, v):
+            return q.clone(), torch.zeros(q.shape[:-1], dtype=torch.float32, device=q.device)
+
+        def bwd(q, k, v, out, lse, g):
+            return g.clone(), k.clone(), v.clone()
+
+        return fwd, bwd
+
+    def fake_jax_op(qualname, fn):
+        if "_fwd_" in qualname:
+            @torch.library.custom_op(qualname, mutates_args=())
+            def op(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+                return fn(q, k, v)
+
+            @op.register_fake
+            def _(q, k, v):
+                return q.new_empty(q.shape), q.new_empty(q.shape[:-1], dtype=torch.float32)
+
+            return op
+
+        @torch.library.custom_op(qualname, mutates_args=())
+        def bwd_op(
+            q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
+            out: torch.Tensor, lse: torch.Tensor, g: torch.Tensor,
+        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+            return fn(q, k, v, out, lse, g)
+
+        @bwd_op.register_fake
+        def _(q, k, v, out, lse, g):
+            return q.new_empty(q.shape), k.new_empty(k.shape), v.new_empty(v.shape)
+
+        return bwd_op
+
+    monkeypatch.setattr(sa, "_make_splash_attention_fn", fake_make_splash)
+    monkeypatch.setattr(sa, "_splash_fwd_ops", {})
+    monkeypatch.setattr(sa, "_splash_ops", types.SimpleNamespace())
+    monkeypatch.setattr(
+        torch, "tpu", types.SimpleNamespace(pallas=types.SimpleNamespace(jax_op=fake_jax_op)), raising=False
+    )
+    return seen
+
+
+def test_splash_folds_batch_into_heads(monkeypatch):
+    import nanochat.splash_attention as sa
+    seen = _install_fake_splash(monkeypatch)
+    q = torch.randn(4, 3, 128, 128)
+    k = torch.randn(4, 1, 128, 128)
+    v = torch.randn(4, 1, 128, 128)
+    y = sa.splash_sdpa(q, k, v, is_causal=True, enable_gqa=True)
+    assert y.shape == q.shape
+    torch.testing.assert_close(y, q)
+    # The PyTorch op sees the original heads. The kernel is told to fold batch.
+    assert seen[-1]["n_heads"] == 3
+    assert seen[-1]["n_kv_heads"] == 1
+    assert seen[-1]["batch"] == 4
+    q1 = torch.randn(1, 3, 128, 128)
+    _ = sa.splash_sdpa(q1, q1, q1, is_causal=True)
+    assert seen[-1]["n_heads"] == 3
+    assert seen[-1]["n_kv_heads"] == 3
+    assert seen[-1]["batch"] == 1
 
 
 def test_splash_mixed_windows_compile_single_graph(monkeypatch):

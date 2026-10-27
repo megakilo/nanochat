@@ -16,6 +16,11 @@ Fallback to the original if you have very limited data AND long documents:
 https://github.com/karpathy/nanochat/blob/3c3a3d7/nanochat/dataloader.py#L78-L117
 """
 
+import bisect
+import queue
+import threading
+from collections import deque
+
 import torch
 import pyarrow.parquet as pq
 
@@ -71,6 +76,79 @@ def _document_batches(split, resume_state_dict, tokenizer_batch_size):
         epoch += 1
 
 
+class _BestFitDocs:
+    """Documents bucketed by length.
+
+    ``pop_best_fit`` returns the oldest document of the greatest length that
+    still fits, matching a linear scan that keeps the first maximum. ``pop_shortest``
+    is the crop source: the oldest document of the smallest length.
+    """
+
+    def __init__(self):
+        self._buckets: dict[int, deque] = {}
+        self._lengths: list[int] = []
+        self.n = 0
+
+    def append(self, tokens: torch.Tensor):
+        length = tokens.numel()
+        bucket = self._buckets.get(length)
+        if bucket is None:
+            bucket = deque()
+            self._buckets[length] = bucket
+            bisect.insort(self._lengths, length)
+        bucket.append(tokens)
+        self.n += 1
+
+    def _pop_len(self, length: int) -> torch.Tensor:
+        bucket = self._buckets[length]
+        doc = bucket.popleft()
+        if not bucket:
+            del self._buckets[length]
+            del self._lengths[bisect.bisect_left(self._lengths, length)]
+        self.n -= 1
+        return doc
+
+    def pop_best_fit(self, remaining: int):
+        # Length 0 never wins the strict ``> best_len`` scan (best_len starts at 0).
+        idx = bisect.bisect_right(self._lengths, remaining) - 1
+        if idx < 0 or self._lengths[idx] == 0:
+            return None
+        return self._pop_len(self._lengths[idx])
+
+    def pop_shortest(self) -> torch.Tensor:
+        if not self._lengths:
+            raise RuntimeError("best-fit document buffer is empty")
+        return self._pop_len(self._lengths[0])
+
+
+def _prefetch_iterator(iterable, depth=3):
+    """Run ``iterable`` on a daemon thread and yield its items.
+
+    The training step calls ``next()`` inside the timed loop. Packing documents
+    is pure Python; doing it on this thread overlaps it with the TPU step.
+    ``depth`` is how many finished batches may sit in memory ahead of the consumer.
+    """
+    filled = queue.Queue(maxsize=depth)
+
+    def _produce():
+        try:
+            for item in iterable:
+                filled.put((True, item))
+        except Exception as exc:
+            filled.put((False, exc))
+        else:
+            filled.put((None, None))
+
+    threading.Thread(target=_produce, name="nanochat-data", daemon=True).start()
+    while True:
+        ok, item = filled.get()
+        if ok is None:
+            return
+        if not ok:
+            raise item
+        yield item
+
+
 def _allocate_token_buffers(B, T, device, pin_memory):
     """Allocate pinned CPU staging and owning device tensors for a (B, T) batch.
 
@@ -92,7 +170,7 @@ def tokenizing_distributed_data_loader_with_state_bos_bestfit(
     tokenizer, B, T, split,
     tokenizer_threads=4, tokenizer_batch_size=128,
     device="tpu", resume_state_dict=None,
-    buffer_size=1000
+    buffer_size=1000, prefetch=False,
 ):
     """
     BOS-aligned dataloader with Best-Fit Cropping.
@@ -115,7 +193,7 @@ def tokenizing_distributed_data_loader_with_state_bos_bestfit(
     row_capacity = T + 1
     batches = _document_batches(split, resume_state_dict, tokenizer_batch_size)
     bos_token = tokenizer.get_bos_token_id()
-    doc_buffer = []
+    docs = _BestFitDocs()
     pq_idx, rg_idx, epoch = 0, 0, 1
 
     def refill_buffer():
@@ -123,58 +201,87 @@ def tokenizing_distributed_data_loader_with_state_bos_bestfit(
         doc_batch, (pq_idx, rg_idx, epoch) = next(batches)
         token_lists = tokenizer.encode(doc_batch, prepend=bos_token, num_threads=tokenizer_threads)
         for tokens in token_lists:
-            doc_buffer.append(tokens)
+            docs.append(torch.tensor(tokens, dtype=torch.long))
 
-    # Pre-allocate 4-slot ring-buffered staging and device buffers once (see _allocate_token_buffers).
-    # Ring-buffering allows up to 4 micro-steps to be pipelined on the TPU without overwriting
-    # in-flight input/target tensors.
+    # Device ring matches the longest TPU queue (4). CPU ring is the prefetch
+    # depth plus two, so a slot can be packed and copied without page-locking
+    # a fresh buffer every microbatch. A CPU slot is reused only after four
+    # later copies have been issued, which is after the training loop has synced.
     device_type = device.type if isinstance(device, torch.device) else str(device).split(":")[0]
     use_accel = device_type == "tpu"
+    device_ring = 4
+    prefetch_depth = 3
+    cpu_ring = prefetch_depth + 2
     row_buffer = torch.empty((B, row_capacity), dtype=torch.long) # for building rows without creating Python lists
-    buffer_sets = [_allocate_token_buffers(B, T, device, pin_memory=use_accel) for _ in range(4)]
-    buf_idx = 0
+    cpu_inputs = []
+    cpu_targets = []
+    for _ in range(cpu_ring):
+        ci, ct, _, _ = _allocate_token_buffers(B, T, device="cpu", pin_memory=use_accel)
+        cpu_inputs.append(ci)
+        cpu_targets.append(ct)
+    device_inputs = []
+    device_targets = []
+    for _ in range(device_ring):
+        _, _, di, dt = _allocate_token_buffers(B, T, device=device, pin_memory=False)
+        device_inputs.append(di)
+        device_targets.append(dt)
 
-    while True:
-        cpu_inputs, cpu_targets, inputs, targets = buffer_sets[buf_idx]
-        buf_idx = (buf_idx + 1) & 3
+    def fill_slot(slot):
         for row_idx in range(B):
             pos = 0
             while pos < row_capacity:
-                # Ensure buffer has documents
-                while len(doc_buffer) < buffer_size:
+                while docs.n < buffer_size:
                     refill_buffer()
-
                 remaining = row_capacity - pos
-
-                # Find largest doc that fits entirely
-                best_idx = -1
-                best_len = 0
-                for i, doc in enumerate(doc_buffer):
-                    doc_len = len(doc)
-                    if doc_len <= remaining and doc_len > best_len:
-                        best_idx = i
-                        best_len = doc_len
-
-                if best_idx >= 0:
-                    doc = doc_buffer.pop(best_idx)
-                    doc_len = len(doc)
-                    row_buffer[row_idx, pos:pos + doc_len] = torch.tensor(doc, dtype=torch.long)
-                    pos += doc_len
-                else:
-                    # No doc fits - crop shortest in buffer to fill remaining and minimize waste
-                    shortest_idx = min(range(len(doc_buffer)), key=lambda i: len(doc_buffer[i]))
-                    doc = doc_buffer.pop(shortest_idx)
-                    row_buffer[row_idx, pos:pos + remaining] = torch.tensor(doc[:remaining], dtype=torch.long)
+                doc = docs.pop_best_fit(remaining)
+                if doc is None:
+                    # Nothing fits. Crop the shortest document and drop its tail.
+                    doc = docs.pop_shortest()
+                    row_buffer[row_idx, pos:pos + remaining].copy_(doc[:remaining])
                     pos += remaining
+                else:
+                    n = doc.numel()
+                    row_buffer[row_idx, pos:pos + n].copy_(doc)
+                    pos += n
+        cpu_inputs[slot].copy_(row_buffer[:, :-1])
+        cpu_targets[slot].copy_(row_buffer[:, 1:])
+        return {"pq_idx": pq_idx, "rg_idx": rg_idx, "epoch": epoch}
 
-        # Copy to pinned CPU buffers, then HtoD into owning device tensors
-        cpu_inputs.copy_(row_buffer[:, :-1])
-        cpu_targets.copy_(row_buffer[:, 1:])
+    free_slots = queue.Queue()
+    for slot in range(cpu_ring):
+        free_slots.put(slot)
+    ready = queue.Queue(maxsize=prefetch_depth)
 
-        state_dict = {"pq_idx": pq_idx, "rg_idx": rg_idx, "epoch": epoch}
+    def _produce():
+        try:
+            while True:
+                slot = free_slots.get()
+                state = fill_slot(slot)
+                ready.put((True, slot, state))
+        except Exception as exc:
+            ready.put((False, exc, None))
 
-        inputs.copy_(cpu_inputs, non_blocking=use_accel)
-        targets.copy_(cpu_targets, non_blocking=use_accel)
+    if prefetch:
+        threading.Thread(target=_produce, name="nanochat-data", daemon=True).start()
+
+    in_flight = deque()
+    dev_idx = 0
+    while True:
+        if prefetch:
+            ok, slot, state_dict = ready.get()
+            if not ok:
+                raise slot
+        else:
+            slot = free_slots.get()
+            state_dict = fill_slot(slot)
+        inputs = device_inputs[dev_idx]
+        targets = device_targets[dev_idx]
+        dev_idx = (dev_idx + 1) % device_ring
+        inputs.copy_(cpu_inputs[slot], non_blocking=use_accel)
+        targets.copy_(cpu_targets[slot], non_blocking=use_accel)
+        in_flight.append(slot)
+        if len(in_flight) > device_ring:
+            free_slots.put(in_flight.popleft())
         yield inputs, targets, state_dict
 
 def tokenizing_distributed_data_loader_bos_bestfit(*args, **kwargs):
